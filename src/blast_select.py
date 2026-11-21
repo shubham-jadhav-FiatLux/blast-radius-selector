@@ -1,0 +1,508 @@
+"""Chooses the sqlglot tests a patch can break and splits them across workers.
+
+Input:  /data/tests.json and /data/commits/<id>.patch
+Output: one JSON line per commit, {"commit": id, "workers": [[test numbers], ...]}
+
+Everything slow happens ahead of time: ``profiling/`` runs the sqlglot suite at the pinned
+commit and records what every test executes and reads, and the pinned sources are indexed
+line by line. At run time each edit is classified and answered from that map:
+
+* comment or blank-line edits outside string literals change nothing;
+* an edit inside a function body is charged to every test that ran the enclosing statement;
+* flipping an ``arg_types`` flag is charged to the tests that validated a node of an
+  affected class while that argument was missing (that flag has no other effect);
+* other module or class level edits are charged to every test that can import the module;
+* data files are charged to the tests that opened them;
+* anything the map cannot vouch for, including edits that no longer compile, runs everything.
+
+Standard library only. Logs go to stderr; stdout carries nothing but answers.
+"""
+
+from __future__ import annotations
+
+import heapq
+import json
+import marshal
+import os
+import re
+import sys
+import zlib
+
+DATA = os.environ.get("BLAST_DATA", "/data")
+HERE = os.path.dirname(os.path.abspath(__file__))
+MAP_PATH = os.environ.get("BLAST_MAP", os.path.join(HERE, "map.bin"))
+SOURCE_ROOT = os.environ.get("BLAST_SOURCE", os.path.join(HERE, "sqlglot-src"))
+
+NO_TESTS, GLOBAL = -1, -2
+NONE, RUNTIME, IMPORT, MIXED, DOC = 0, 1, 2, 3, 4
+IN_STRING, STRING_AFTER, CONTINUED = 1, 2, 4
+WORKER_MS = 2000
+MAX_WORKERS = 8
+
+CONFIG_FILES = {"pyproject.toml", "setup.cfg", "tox.ini", "pytest.ini", "conftest.py", ".coveragerc"}
+CODING_RE = re.compile(r"^[ \t\f]*#.*?coding[:=]")
+SIMPLE_VALUE_RE = re.compile(r"True|False|None|[-+]?\d+")
+
+
+def log(*parts):
+    print("blast:", *parts, file=sys.stderr)
+
+
+# ----------------------------------------------------------------------------- patches
+class Block:
+    """One run of removed/added lines. ``start`` is the old line number of the first removed
+    line; for a pure insertion it is the old line the new lines are inserted before."""
+
+    __slots__ = ("start", "old", "new")
+
+    def __init__(self, start):
+        self.start = start
+        self.old = []
+        self.new = []
+
+
+class FileChange:
+    __slots__ = ("path", "old_path", "status", "blocks")
+
+    def __init__(self, old_path, path):
+        self.old_path = old_path
+        self.path = path
+        self.status = "modify"
+        self.blocks = []
+
+
+_HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+_DIFF = re.compile(r"^diff --git a/(.*) b/(.*)$")
+
+
+def parse_patch(text):
+    changes = []
+    cur = None
+    block = None
+    old_left = new_left = 0
+    old_ln = 0
+    for line in text.split("\n"):
+        if old_left > 0 or new_left > 0:
+            tag = line[:1]
+            if tag == "-":
+                if block is None:
+                    block = Block(old_ln)
+                    cur.blocks.append(block)
+                block.old.append(line[1:])
+                old_ln += 1
+                old_left -= 1
+                continue
+            if tag == "+":
+                if block is None:
+                    block = Block(old_ln)
+                    cur.blocks.append(block)
+                block.new.append(line[1:])
+                new_left -= 1
+                continue
+            if tag == "\\":
+                continue
+            # context line (" " prefix; tolerate a stripped empty line)
+            block = None
+            old_ln += 1
+            old_left -= 1
+            new_left -= 1
+            continue
+        if line.startswith("diff --git "):
+            m = _DIFF.match(line)
+            cur = FileChange(m.group(1), m.group(2)) if m else FileChange(None, None)
+            changes.append(cur)
+            block = None
+            continue
+        if cur is None:
+            continue
+        if line.startswith("@@"):
+            m = _HUNK.match(line)
+            if not m:
+                cur.status = "unknown"
+                continue
+            old_ln = int(m.group(1))
+            old_left = int(m.group(2)) if m.group(2) is not None else 1
+            new_left = int(m.group(4)) if m.group(4) is not None else 1
+            if old_left == 0:
+                old_ln += 1  # "-N,0" means the insertion goes after line N
+            block = None
+        elif line.startswith("new file mode"):
+            cur.status = "new"
+        elif line.startswith("deleted file mode"):
+            cur.status = "delete"
+        elif line.startswith("rename from") or line.startswith("rename to") or line.startswith("copy "):
+            cur.status = "rename"
+        elif line.startswith("Binary files") or line.startswith("GIT binary patch"):
+            cur.status = "binary"
+        elif line.startswith("--- "):
+            p = line[4:].strip()
+            if p != "/dev/null" and p.startswith("a/"):
+                cur.old_path = p[2:]
+        elif line.startswith("+++ "):
+            p = line[4:].strip()
+            if p == "/dev/null":
+                cur.status = "delete"
+            elif p.startswith("b/"):
+                cur.path = p[2:]
+    return changes
+
+
+# ----------------------------------------------------------------------------- line helpers
+def strip_comment(s):
+    """The code part of one physical line (a '#' inside a string literal is not a comment)."""
+    if "#" not in s:
+        return s
+    i, n, quote = 0, len(s), None
+    while i < n:
+        c = s[i]
+        if quote:
+            if c == "\\":
+                i += 2
+                continue
+            if s.startswith(quote, i):
+                i += len(quote)
+                quote = None
+                continue
+            i += 1
+            continue
+        if c == "#":
+            return s[:i]
+        if c == '"' or c == "'":
+            quote = s[i : i + 3] if s[i : i + 3] in ('"""', "'''") else c
+            i += len(quote)
+            continue
+        i += 1
+    return s
+
+
+def code_lines(lines):
+    out = []
+    for text in lines:
+        code = strip_comment(text).rstrip()
+        if code.strip():
+            out.append(code)
+    return out
+
+
+def _word(c):
+    return c.isalnum() or c == "_"
+
+
+def changed_columns(old, new):
+    """Old-line column range [a, b) that differs from the new line, widened to whole words,
+    and the old and new text of that range."""
+    n = min(len(old), len(new))
+    p = 0
+    while p < n and old[p] == new[p]:
+        p += 1
+    s = 0
+    while s < n - p and old[len(old) - 1 - s] == new[len(new) - 1 - s]:
+        s += 1
+    while p > 0 and (_word(old[p - 1]) or _word(new[p - 1])):
+        p -= 1
+    while s > 0 and (_word(old[len(old) - s]) or _word(new[len(new) - s])):
+        s -= 1
+    return p, len(old) - s, old[p : len(old) - s], new[p : len(new) - s]
+
+
+# ----------------------------------------------------------------------------- selection
+class Selector:
+    def __init__(self, blob, sources):
+        self.files = blob["files"]
+        self.reads = blob["reads"]
+        self.scopes = blob["scopes"]
+        self.sets = blob["sets"]
+        self.sources = sources
+        self._lines = {}
+
+    # Accumulates either a bitset over map test indices or the GLOBAL marker.
+    def run(self, patch_text):
+        acc = [0, False]
+        for change in parse_patch(patch_text):
+            self.file_change(change, acc)
+            if acc[1]:
+                break
+        return acc
+
+    def charge(self, acc, sid):
+        if sid == GLOBAL:
+            acc[1] = True
+        elif sid >= 0:
+            acc[0] |= self.sets[sid]
+
+    def file_change(self, ch, acc):
+        path = ch.path or ch.old_path
+        if path is None or ch.status == "unknown":
+            acc[1] = True
+            return
+        base = path.rsplit("/", 1)[-1]
+        if base in CONFIG_FILES:
+            acc[1] = True
+            return
+        if path.endswith(".py"):
+            info = self.files.get(path)
+            if ch.status in ("delete", "rename", "binary") or (info is None and ch.status != "new"):
+                self.module_level(path, info, acc)
+                return
+            if info is None:  # a new module nothing imports yet
+                if path.startswith("sqlglot/"):
+                    acc[1] = True
+                return
+            self.python_change(path, info, ch.blocks, acc)
+            return
+        self.data_change(path, ch, acc)
+
+    def data_change(self, path, ch, acc):
+        self.charge(acc, self.reads.get(path, NO_TESTS))
+        if ch.old_path and ch.old_path != path:
+            self.charge(acc, self.reads.get(ch.old_path, NO_TESTS))
+        if ch.status in ("new", "delete", "rename"):
+            parts = path.split("/")
+            for i in range(1, len(parts)):
+                self.charge(acc, self.reads.get("/".join(parts[:i]) + "/", NO_TESTS))
+
+    def module_level(self, path, info, acc):
+        """An edit that runs when the module is imported."""
+        if path.startswith("tests/"):
+            sid = self.scopes.get(path)
+            if sid is None:
+                acc[1] = True
+            else:
+                self.charge(acc, sid)
+        elif path.startswith("sqlglot/") or info is None:
+            acc[1] = True
+        else:
+            self.charge(acc, info["users"])
+
+    def source_lines(self, path, info):
+        if path not in self._lines:
+            lines = None
+            src = os.path.join(self.sources, path)
+            try:
+                with open(src, "rb") as f:
+                    raw = f.read()
+                if self.sha1(raw) == info["sha1"]:
+                    lines = raw.decode("utf-8").split("\n")
+            except OSError:
+                pass
+            self._lines[path] = lines
+        return self._lines[path]
+
+    @staticmethod
+    def sha1(raw):
+        import hashlib
+
+        return hashlib.sha1(raw).hexdigest()
+
+    def inert(self, info, b):
+        """True if the block only adds, removes or rewrites comments and blank lines."""
+        flags = info["flags"]
+        n = len(flags)
+        for i in range(len(b.old)):
+            ln = b.start + i
+            if 1 <= ln <= n and flags[ln - 1] & (IN_STRING | CONTINUED):
+                return False
+        anchor = b.start - 1
+        if 1 <= anchor <= n and flags[anchor - 1] & (STRING_AFTER | CONTINUED):
+            return False
+        if b.start <= 2 and any(CODING_RE.match(t) for t in b.old + b.new):
+            return False
+        return code_lines(b.old) == code_lines(b.new)
+
+    def compiles(self, path, info, blocks):
+        """Compile the patched file; an edit that breaks the syntax breaks every importer."""
+        lines = self.source_lines(path, info)
+        if lines is None:
+            return True  # no pinned source to check against; keep the map's answer
+        out = []
+        pos = 1
+        for b in sorted(blocks, key=lambda b: b.start):
+            if b.start < pos or b.start - 1 > len(lines):
+                return False
+            out.extend(lines[pos - 1 : b.start - 1])
+            if lines[b.start - 1 : b.start - 1 + len(b.old)] != b.old:
+                return False  # the patch does not apply to the pinned file
+            out.extend(b.new)
+            pos = b.start + len(b.old)
+        out.extend(lines[pos - 1 :])
+        try:
+            compile("\n".join(out), path, "exec", dont_inherit=True)
+        except (SyntaxError, ValueError):
+            return False
+        return True
+
+    def python_change(self, path, info, blocks, acc):
+        kind = info["kind"]
+        n = len(kind)
+        live = [b for b in blocks if not self.inert(info, b)]
+        if not live:
+            return
+        if not self.compiles(path, info, blocks):
+            log(path, "does not compile after the patch")
+            self.module_level(path, info, acc)
+            return
+        sets = info["sets"]
+        for b in live:
+            pairs = len(b.old) == len(b.new)
+            if b.old:
+                lines = range(b.start, b.start + len(b.old))
+            else:
+                lines = (b.start - 1, b.start)
+            for i, ln in enumerate(lines):
+                if not 1 <= ln <= n:
+                    continue
+                k = kind[ln - 1]
+                if k == RUNTIME:
+                    self.charge(acc, sets.get(ln, NO_TESTS))
+                    continue
+                cols = None
+                if pairs and b.old:
+                    cols = changed_columns(b.old[i], b.new[i])
+                if k == MIXED and cols is not None:
+                    a, z = cols[0], max(cols[1], cols[0] + 1)
+                    if any(c0 <= a and z <= c1 for c0, c1 in info["cols"].get(ln, ())):
+                        self.charge(acc, sets.get(ln, NO_TESTS))
+                        continue
+                if k == DOC and cols is not None and cols[2].count('"') == cols[3].count('"') and cols[2].count("'") == cols[3].count("'"):
+                    continue
+                if k == IMPORT and cols is not None and ln in info["argt"]:
+                    if SIMPLE_VALUE_RE.fullmatch(cols[2].strip()) and SIMPLE_VALUE_RE.fullmatch(cols[3].strip()):
+                        self.charge(acc, info["argt"][ln])
+                        continue
+                if not b.old and k in (NONE, DOC) and not code_lines(b.new):
+                    continue
+                self.module_level(path, info, acc)
+            if acc[1]:
+                return
+
+
+# ----------------------------------------------------------------------------- packing
+def split(numbers, ms):
+    """Spread tests over 1..8 workers, minimising the busiest worker plus 2 s per worker."""
+    if not numbers:
+        return []
+    items = sorted(numbers, key=lambda t: (-ms[t], t))
+    total = sum(ms[t] for t in items)
+    best = None
+    for k in range(1, min(MAX_WORKERS, len(items)) + 1):
+        bound = max(ms[items[0]], -(-total // k)) + WORKER_MS * k
+        if best is not None and bound >= best[0]:
+            continue
+        heap = [(0, i) for i in range(k)]
+        bins = [[] for _ in range(k)]
+        loads = [0] * k
+        for t in items:
+            load, i = heapq.heappop(heap)
+            bins[i].append(t)
+            loads[i] = load + ms[t]
+            heapq.heappush(heap, (loads[i], i))
+        if len(items) <= 400:
+            _improve(bins, loads, ms)
+        used = [b for b in bins if b]
+        cost = max(loads) + WORKER_MS * len(used)
+        if best is None or cost < best[0]:
+            best = (cost, used)
+    return best[1]
+
+
+def _improve(bins, loads, ms, rounds=64):
+    """Moves and swaps out of the busiest worker while they lower its load."""
+    k = len(bins)
+    if k < 2:
+        return
+    for _ in range(rounds):
+        hi = max(range(k), key=loads.__getitem__)
+        top = loads[hi]
+        done = False
+        for lo in sorted(range(k), key=loads.__getitem__):
+            if lo == hi:
+                continue
+            gap = top - loads[lo]
+            for t in bins[hi]:
+                d = ms[t]
+                if 0 < d < gap:
+                    bins[hi].remove(t)
+                    bins[lo].append(t)
+                    loads[hi] -= d
+                    loads[lo] += d
+                    done = True
+                    break
+            if done:
+                break
+            for t in bins[hi]:
+                for u in bins[lo]:
+                    delta = ms[t] - ms[u]
+                    if 0 < delta < gap:
+                        bins[hi].remove(t)
+                        bins[lo].remove(u)
+                        bins[hi].append(u)
+                        bins[lo].append(t)
+                        loads[hi] -= delta
+                        loads[lo] += delta
+                        done = True
+                        break
+                if done:
+                    break
+            if done:
+                break
+        if not done:
+            return
+
+
+# ----------------------------------------------------------------------------- main
+def main():
+    with open(os.path.join(DATA, "tests.json"), "rb") as f:
+        listing = json.load(f)
+    tests = listing["tests"]
+    ms = {t["number"]: int(round(t["seconds"] * 1000)) for t in tests}
+    every = sorted(ms)
+
+    selector = None
+    index_to_number = []
+    unknown = []
+    try:
+        with open(MAP_PATH, "rb") as f:
+            blob = marshal.loads(zlib.decompress(f.read()))
+        number_of = {t["id"]: t["number"] for t in tests}
+        index_to_number = [number_of.get(t, -1) for t in blob["tests"]]
+        mapped = set(index_to_number)
+        unknown = [t for t in every if t not in mapped]
+        if unknown:
+            log(len(unknown), "tests are not in the map; they run on every commit")
+        selector = Selector(blob, SOURCE_ROOT)
+    except Exception as error:  # noqa: BLE001
+        log("map unavailable, running everything:", repr(error))
+
+    commits = sorted(name[:-6] for name in os.listdir(os.path.join(DATA, "commits")) if name.endswith(".patch"))
+    cache = {}
+    out = []
+    for cid in commits:
+        try:
+            with open(os.path.join(DATA, "commits", cid + ".patch"), encoding="utf-8", errors="replace") as f:
+                text = f.read()
+            if selector is None:
+                raise RuntimeError("no map")
+            bits, everything = selector.run(text)
+        except Exception as error:  # noqa: BLE001
+            log(cid, "selection failed, running everything:", repr(error))
+            bits, everything = 0, True
+        key = None if everything else bits
+        workers = cache.get(key)
+        if workers is None:
+            if everything:
+                chosen = every
+            else:
+                chosen = set(unknown)
+                while bits:
+                    low = bits & -bits
+                    number = index_to_number[low.bit_length() - 1]
+                    if number >= 0:
+                        chosen.add(number)
+                    bits ^= low
+            workers = cache[key] = split(chosen, ms)
+        out.append(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")))
+    sys.stdout.write("\n".join(out) + ("\n" if out else ""))
+
+
+if __name__ == "__main__":
+    main()
