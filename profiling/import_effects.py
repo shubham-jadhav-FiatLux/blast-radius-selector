@@ -9,7 +9,9 @@ or reads something derived from it while the classes were being built:
   attribute read, so ``Parser.FUNCTIONS`` is not confused with ``DuckDBParser.FUNCTIONS``;
 * class-creation hooks (``__init_subclass__``, metaclass ``__new__``) that compute attributes
   of every subclass and of a dialect's tokenizer, parser and generator;
-* module globals built from it, whose readers are the statements that mention them.
+* module globals built from it, and the bindings other modules import them under
+  (``from sqlglot.typing.spark import EXPRESSION_METADATA``), each owned by its module: the
+  readers of ``sqlglot.typing.mysql``'s table are not those of ``sqlglot.typing.duckdb``'s.
 
 The profile says which tests read which ``owner:attribute`` (owner = the class whose ``__dict__``
 holds it, so inherited reads are charged to the defining class). This module computes the
@@ -24,7 +26,27 @@ from collections import defaultdict
 
 GLOBAL = -2
 ANY = "*"
-MODULE = "<global>"
+MODULE = "<module>"  # owner of a module's globals: "<module>sqlglot.typing.mysql"
+
+
+def mkey(modname):
+    return MODULE + modname
+
+
+def is_module(owner):
+    return owner.startswith(MODULE)
+
+
+def absolute(modname, is_package, level, source):
+    """The module a "from <level dots><source> import ..." in module ``modname`` names."""
+    if not level:
+        return source
+    parts = modname.split(".") if is_package else modname.split(".")[:-1]
+    if level > 1:
+        parts = parts[: len(parts) - (level - 1)] if len(parts) >= level - 1 else []
+    if not parts:
+        return None
+    return ".".join(parts + ([source] if source else []))
 
 
 def key_text(key):
@@ -53,7 +75,8 @@ class ImportEffects:
     def __init__(self, files, families, instrumented, reads, global_reads, name_cov):
         """files: rel -> source index; families: class key -> (mro keys, component keys);
         instrumented: {(owner, attr)}; reads: "owner:attr" -> bits; global_reads: tags read
-        in contexts charged to every test; name_cov(name) -> bits or GLOBAL."""
+        in contexts charged to every test; name_cov(module, name) -> bits or GLOBAL, the tests
+        that read that module global."""
         self.families = families
         self.instrumented = instrumented
         self.reads = reads
@@ -67,20 +90,33 @@ class ImportEffects:
                 self._subclasses[base].add(key)
         self.derivations = []  # (scope, owner key, targets, resolved reads, hook names)
         self.by_name = defaultdict(list)
+        self.star = defaultdict(set)  # module key -> keys of the modules that import * from it
         for rel, ix in files.items():
             if not rel.startswith("sqlglot/"):
                 continue
-            mod = sys.modules.get(module_name(rel))
+            modname = module_name(rel)
+            here = mkey(modname)
+            mod = sys.modules.get(modname)
+            for level, source, name, alias in ix.get("import_binds", ()):
+                origin = absolute(modname, rel.endswith("/__init__.py"), level, source)
+                if origin is None:
+                    continue
+                if name == "*":
+                    self.star[mkey(origin)].add(here)
+                    continue
+                # the import binds this module's ``alias`` to the other module's ``name``
+                self.by_name[name].append(len(self.derivations))
+                self.derivations.append(("module", here, (alias,), frozenset({(mkey(origin), name)}), frozenset(), frozenset()))
             for scope, qualname, targets, bare, refs, *rest in ix["derivations"]:
                 keyonly = frozenset(rest[0]) if rest else frozenset()
-                owner = "%s.%s" % (module_name(rel), qualname) if qualname else MODULE
+                owner = "%s.%s" % (modname, qualname) if qualname else here
                 if scope == "hook":
                     entry = (scope, owner, targets, (), frozenset(bare), keyonly)
                     names = set(bare)
                 else:
                     resolved = set()
                     for name in bare:
-                        resolved.add((MODULE, name))
+                        resolved.add((here, name))
                         if scope == "class":
                             resolved.add((owner, name))
                     for receiver, attr in refs:
@@ -114,7 +150,7 @@ class ImportEffects:
                     return {("%s.%s" % (klass.__module__, klass.__qualname__), attr)}
             return {(ANY, attr)}
         if isinstance(obj, type(sys)):
-            return {(MODULE, attr)}
+            return {(mkey(obj.__name__), attr)}
         return {(ANY, attr)}
 
     def _class(self, key):
@@ -183,20 +219,22 @@ class ImportEffects:
         frontier = [start]
         while frontier:
             o, n = frontier.pop()
+            if is_module(o) and not n.startswith("_"):
+                for importer in self.star.get(o, ()):
+                    if (importer, n) not in done:
+                        done.add((importer, n))
+                        frontier.append((importer, n))
             for index in self.by_name.get(n, ()):
                 scope, d_owner, targets, reads, hook_names, keyonly = self.derivations[index]
                 if values_only and (o, n) == start and n in keyonly:
                     continue
                 new = []
                 if scope == "hook":
-                    members = self.hook_family(d_owner) if o in (MODULE, ANY) else self.family(o)
+                    members = self.hook_family(d_owner) if o == ANY or is_module(o) else self.family(o)
                     for member in members:
                         new.extend((member, t) for t in targets)
                 elif (o, n) in reads or (ANY, n) in reads:
-                    if scope == "class":
-                        new.extend((d_owner, t) for t in targets)
-                    else:
-                        new.extend((MODULE, t) for t in targets)
+                    new.extend((d_owner, t) for t in targets)
                 for pair in new:
                     if pair not in done:
                         done.add(pair)
@@ -230,12 +268,12 @@ class ImportEffects:
         """Like tests_for, for an edit to the value of one entry of a dict attribute: the dict
         itself and copies made by spreading it into another dict display are charged by key,
         everything derived in any other way by attribute."""
-        if owner not in self.families or (owner, attr) not in self.instrumented:
+        if not is_module(owner) and (owner not in self.families or (owner, attr) not in self.instrumented):
             return GLOBAL
         bits = 0
         for o, n in self.affected(owner, attr, values_only=True):
-            if o == MODULE:
-                cov = self.name_cov(n)
+            if is_module(o):
+                cov = self.name_cov(o[len(MODULE):], n)
                 if cov == GLOBAL:
                     return GLOBAL
                 bits |= cov
@@ -264,13 +302,13 @@ class ImportEffects:
         return result
 
     def _compute(self, owner, attr):
-        if owner != MODULE:
+        if not is_module(owner):
             if owner not in self.families or (owner, attr) not in self.instrumented:
                 return GLOBAL
         bits = 0
         for o, n in self.affected(owner, attr):
-            if o == MODULE:
-                cov = self.name_cov(n)
+            if is_module(o):
+                cov = self.name_cov(o[len(MODULE):], n)
                 if cov == GLOBAL:
                     return GLOBAL
                 bits |= cov

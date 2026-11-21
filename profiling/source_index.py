@@ -79,6 +79,10 @@ class _Indexer:
         self.derivations: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = []
         # identifier -> lines of runtime statements that mention it
         self.runtime_names: dict[str, set[int]] = {}
+        # the same for bare names only (and identifier strings): reads of this module's globals
+        self.runtime_bare: dict[str, set[int]] = {}
+        # module-level "from <module> import <name> as <alias>": (level, module, name, alias)
+        self.import_binds: list[tuple[int, str, str, str]] = []
         self.hook_owner = ""
         self.pure_lines: set[int] = set()
         # line -> [(class qualname, attribute, key source, value col0, value col1)]
@@ -154,6 +158,17 @@ class _Indexer:
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             for dec in stmt.decorator_list:
                 self.mark_node(dec, here, depth + 1)
+            if here == RUNTIME:
+                # a def or class statement run at run time evaluates its decorators, defaults
+                # and bases then
+                parts = list(stmt.decorator_list)
+                if isinstance(stmt, ast.ClassDef):
+                    parts += stmt.bases + [k.value for k in stmt.keywords]
+                else:
+                    parts += stmt.args.defaults + [d for d in stmt.args.kw_defaults if d is not None]
+                for part in parts:
+                    for name in _bare_names_read(part):
+                        self.runtime_bare.setdefault(name, set()).update(range(span[0], span[1] + 1))
             self.mark(span[0], span[1], here, span, depth)
             if here == IMPORT and not isinstance(stmt, ast.ClassDef):
                 self.note_defaults(stmt)
@@ -178,12 +193,17 @@ class _Indexer:
                 self.imports.add((0, alias.name, ()))
         elif here == IMPORT and isinstance(stmt, ast.ImportFrom):
             self.imports.add((stmt.level, stmt.module or "", tuple(a.name for a in stmt.names)))
+            if scope == "module":
+                for a in stmt.names:
+                    self.import_binds.append((stmt.level, stmt.module or "", a.name, a.asname or a.name))
         # Compound statements keep the scope of their parent for their bodies.
         self.mark(span[0], span[1], here, span, depth)
         if here == RUNTIME:
             for part in _header_nodes(stmt):
                 for name in _names_read(part):
                     self.runtime_names.setdefault(name, set()).update(range(span[0], span[1] + 1))
+                for name in _bare_names_read(part):
+                    self.runtime_bare.setdefault(name, set()).update(range(span[0], span[1] + 1))
         if here == IMPORT:
             for part in _header_nodes(stmt):
                 self.mark_lambdas(part, depth)
@@ -249,6 +269,11 @@ class _Indexer:
         """Entries of a dict display assigned at class or module level, so the selector can
         charge an edit to one entry's value to the tests that looked up that key."""
         value = getattr(stmt, "value", None)
+        if len(names) == 1 and _key_preserving_copy(value):
+            # X = Y.copy() / dict(Y): the same keys and values as Y, so lookups by key see an
+            # edit to one of Y's entries exactly where lookups of Y would
+            self.dict_displays.append((qualname, names[0]))
+            return
         if not isinstance(value, ast.Dict) or len(names) != 1:
             return
         self.dict_displays.append((qualname, names[0]))
@@ -510,6 +535,30 @@ def _names_read(node):
     return out
 
 
+def _key_preserving_copy(value):
+    """``NAME.copy()`` or ``dict(NAME)``: a shallow copy of a dict named by a (dotted) name."""
+    if not isinstance(value, ast.Call) or value.keywords:
+        return False
+    func = value.func
+    if isinstance(func, ast.Attribute) and func.attr == "copy" and not value.args:
+        return _dotted(func.value)
+    if isinstance(func, ast.Name) and func.id == "dict" and len(value.args) == 1:
+        return _dotted(value.args[0])
+    return False
+
+
+def _bare_names_read(node):
+    """Every bare name an expression reads (a global, unless something local shadows it), and
+    every identifier-like string in it (``globals()["NAME"]``)."""
+    out = set()
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Name):
+            out.add(sub.id)
+        elif isinstance(sub, ast.Constant) and isinstance(sub.value, str) and sub.value.isidentifier():
+            out.add(sub.value)
+    return out
+
+
 def _header_nodes(stmt):
     if isinstance(stmt, (ast.If, ast.While)):
         return [stmt.test]
@@ -652,6 +701,8 @@ def index_source(source: str) -> dict:
         "defaults": ix.defaults,
         "derivations": ix.derivations,
         "runtime_names": {k: sorted(v) for k, v in ix.runtime_names.items()},
+        "runtime_bare": {k: sorted(v) for k, v in ix.runtime_bare.items()},
+        "import_binds": ix.import_binds,
         "imports": sorted(ix.imports),
         "pure": sorted(ix.pure_lines),
         "units": compile_units(tree),

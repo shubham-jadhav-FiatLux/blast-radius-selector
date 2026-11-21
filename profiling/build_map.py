@@ -25,7 +25,7 @@ from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from import_effects import ANY, MODULE, ImportEffects, module_name  # noqa: E402
+from import_effects import ANY, ImportEffects, absolute, is_module, mkey, module_name  # noqa: E402
 from source_index import DOC, IMPORT, MIXED, NONE, RUNTIME, index_source  # noqa: E402
 
 NO_TESTS = -1
@@ -130,6 +130,8 @@ def read_profile(paths, meta=None):
                 entry.setdefault("data", set()).update(payload.split(","))
             elif kind == "Y" and payload:
                 entry.setdefault("keys", set()).update((tag, k) for tag, k in json.loads(payload))
+            elif kind == "N" and payload:
+                entry.setdefault("mods", set()).update(payload.split(","))
     return contexts
 
 
@@ -496,6 +498,7 @@ def main():
     ap.add_argument("--tpcds", default=None, help="reference fingerprints from src/tpcds_check.py")
     ap.add_argument("--tpcds-stages", default=None, help="front/back lines per query from profiling/tpcds_stages.py")
     ap.add_argument("--defaults", nargs="*", default=[], help="profiles recorded with PROFILE_DEFAULTS=1")
+    ap.add_argument("--modreads", nargs="*", default=[], help="profiles recorded with PROFILE_MODREADS=1")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     src = os.path.abspath(args.src)
@@ -632,8 +635,13 @@ def main():
         given (owner, attribute) pairs, or None when that is not known query by query."""
         queries, back, steps = set(), set(), 0
         for o, n in pairs:
-            if o in (MODULE, ANY):
+            if o == ANY:
                 return None
+            if is_module(o):
+                got = global_readers(o[len(mkey("")):], n)
+                if got == GLOBAL or got & pq_bit:
+                    return None  # the per-query test reads that global: not known query by query
+                continue
             tag = "%s:%s" % (o, n)
             seen = attr_queries.get(tag, set())
             front_q, back_q, mask = stage_attrs.get(tag, (set(), set(), 0))
@@ -679,7 +687,7 @@ def main():
                     bits = GLOBAL
                     break
                 for qualname, name in entries:
-                    owner = "%s.%s" % (module_name(orel), qualname) if qualname else MODULE
+                    owner = "%s.%s" % (module_name(orel), qualname) if qualname else mkey(module_name(orel))
                     got = effects.tests_for(owner, name)
                     if got == GLOBAL:
                         bits = GLOBAL
@@ -720,7 +728,8 @@ def main():
         return bits
 
     def name_cov(name):
-        """Tests that ran a statement mentioning ``name`` (readers of a module global)."""
+        """Tests that ran a statement mentioning ``name`` (readers of a module global of that
+        name, when module reads were not profiled)."""
         if name not in name_cache:
             name_cache[name] = GLOBAL  # guards against cycles while it is being computed
             bits = 0
@@ -733,7 +742,84 @@ def main():
             name_cache[name] = bits
         return name_cache[name]
 
-    effects = ImportEffects(files, meta["families"], meta["instrumented"], attr_reads, attr_global, name_cov)
+    # Test modules bind sqlglot globals while they are collected ("from sqlglot.errors import
+    # ANSI_UNDERLINE"), often a helper module imported by whichever test file is collected
+    # first. The readers of such a binding are the test lines that use the name: (origin module,
+    # name) -> [(test file, alias)]. Names a test module also uses at import time are noted.
+    test_binds = defaultdict(list)
+    test_import_names = {}
+    for rel, ix in files.items():
+        if not rel.startswith("tests/"):
+            continue
+        tmod = module_name(rel)
+        used = set()
+        for d in ix["derivations"]:
+            used |= set(d[3]) | {r[0].split(".")[0] for r in d[4] if r[0]}
+        test_import_names[rel] = used
+        for level, source, name, alias in ix.get("import_binds", ()):
+            origin = absolute(tmod, rel.endswith("/__init__.py"), level, source)
+            if origin:
+                test_binds[(origin, name)].append((rel, alias))
+
+    # Module globals read from outside their module (PROFILE_MODREADS=1): (module, name) -> tests.
+    # A read of the module's __dict__ or dir() reads every global.
+    mod_bits = defaultdict(int)
+    if args.modreads:
+        for ctx, entry in read_profile(args.modreads).items():
+            if ctx == "<other>":
+                continue  # between tests: the profiler's own resets of sqlglot's caches
+            charged = tests.resolve(ctx)
+            for tag in entry.get("mods", ()):
+                modname, _, name = tag.rpartition(":")
+                key = (modname, name)
+                if ctx.startswith("<collect>|") and (key in test_binds or (modname, "*") in test_binds):
+                    continue  # a test module's import: charged through its uses (test_binds)
+                mod_bits[key] = GLOBAL if charged == GLOBAL or mod_bits[key] == GLOBAL else mod_bits[key] | charged
+    rel_of = {module_name(rel): rel for rel in files if rel.startswith("sqlglot/")}
+    module_cache = {}
+
+    def global_readers(modname, name):
+        """Tests that can read global ``name`` of module ``modname``: those that ran a statement
+        of that module mentioning it as a bare name, those that read it from outside (attribute
+        access, a run-time ``from ... import``, the module's __dict__), and, for import-time code
+        elsewhere that mentions it as an attribute, whoever that code's results reach."""
+        if not args.modreads:
+            return name_cov(name)
+        key = (modname, name)
+        if key in module_cache:
+            return module_cache[key]
+        module_cache[key] = GLOBAL  # guards against cycles while it is being computed
+        rel = rel_of.get(modname)
+        bits = GLOBAL if rel is None else 0
+        if bits != GLOBAL:
+            parts = [union_eff(rel, files[rel].get("runtime_bare", {}).get(name, ()))]
+            parts += [mod_bits.get((modname, n), 0) for n in (name, "__dict__", "__dir__")]
+            for orel, lines in mentions.get(name, ()):
+                at_import = [ln for ln in lines if (orel, ln) in global_func]
+                if at_import:
+                    parts.append(union_eff(orel, at_import))
+            # test modules that import it, and test modules importing it from those
+            stack, seen = [key], set()
+            while stack:
+                origin = stack.pop()
+                for trel, alias in test_binds.get(origin, []) + test_binds.get((origin[0], "*"), []):
+                    alias = origin[1] if alias == "*" else alias
+                    if (trel, alias) in seen:
+                        continue
+                    seen.add((trel, alias))
+                    if alias in test_import_names.get(trel, ()):
+                        parts.append(GLOBAL)  # used while that test module is imported
+                    parts.append(union_eff(trel, files[trel].get("runtime_bare", {}).get(alias, ())))
+                    stack.append((module_name(trel), alias))
+            for got in parts:
+                if got == GLOBAL:
+                    bits = GLOBAL
+                    break
+                bits |= got
+        module_cache[key] = bits
+        return bits
+
+    effects = ImportEffects(files, meta["families"], meta["instrumented"], attr_reads, attr_global, global_readers)
 
     # Dict keys looked up per test (PROFILE_KEYS=1). A test that read a dict attribute but left
     # no key record used it in a way the profile cannot see and is charged for every key.
@@ -1008,12 +1094,12 @@ def main():
             for ln, entries in ix.get("dict_entries", {}).items():
                 out = []
                 for qualname, attr, source, c0, c1 in entries:
-                    if not qualname:
-                        continue  # module-level dicts are not profiled by key
                     k = effects.resolve_key(rel, qualname, source)
                     if k is None:
                         continue
-                    owner = "%s.%s" % (module_name(rel), qualname)
+                    # a module-level dict is not profiled by key itself; the class attributes
+                    # it is copied into are
+                    owner = "%s.%s" % (module_name(rel), qualname) if qualname else mkey(module_name(rel))
                     sid = table.add(effects.tests_for_key(owner, attr, k, keyed, displays))
                     qs = attr_query_sets(effects.affected(owner, attr, values_only=True)) \
                         if sid >= 0 and table.sets[sid] & pq_bit else None
@@ -1027,7 +1113,7 @@ def main():
                 check = ln not in pure
                 pairs = set()
                 for qualname, name in entries:
-                    owner = "%s.%s" % (module_name(rel), qualname) if qualname else MODULE
+                    owner = "%s.%s" % (module_name(rel), qualname) if qualname else mkey(module_name(rel))
                     got = effects.tests_for(owner, name)
                     if got == GLOBAL:
                         bits = GLOBAL

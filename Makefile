@@ -29,6 +29,7 @@ WEAK ?= $(OUT)/profile/weak_main.txt.gz $(OUT)/profile/weak_max_nodes.txt.gz
 WEAK_OUTCOMES ?= $(OUT)/profile/weak_main.json $(OUT)/profile/weak_max_nodes.json
 OUTCOMES ?= $(OUT)/profile/trace_main.json $(OUT)/profile/trace_max_nodes.json
 DEFAULTS ?= $(OUT)/profile/defaults_main.txt.gz $(OUT)/profile/defaults_max_nodes.txt.gz
+MODREADS ?= $(OUT)/profile/modreads_main.txt.gz $(OUT)/profile/modreads_max_nodes.txt.gz
 
 # Reference results of each TPC-DS query of test_execute_tpcds, for single-query re-checks.
 reference:
@@ -45,7 +46,7 @@ map:
 	docker run --rm --user $$(id -u):$$(id -g) -v $(abspath $(SQLGLOT)):/src:ro -v $(CURDIR):/repo -w /repo $(PROFILE_IMAGE) \
 		python profiling/build_map.py --src /src --out data/map.bin \
 		--profile $(PROFILES) --keys $(PROFILES) --weak $(WEAK) --weak-outcomes $(WEAK_OUTCOMES) --outcomes $(OUTCOMES) \
-		--tpcds data/tpcds_reference.json --tpcds-stages data/tpcds_stages.json --defaults $(DEFAULTS)
+		--tpcds data/tpcds_reference.json --tpcds-stages data/tpcds_stages.json --defaults $(DEFAULTS) --modreads $(MODREADS)
 
 # The pinned sources the image checks patches against (sqlglot's Python files, its SQL fixtures and
 # the TPC-DS data).

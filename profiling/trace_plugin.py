@@ -158,6 +158,9 @@ def _flush(ctx):
     data = _data_reads.pop(ctx, None)
     if data:
         _out.write("D %s\t%s\n" % (ctx, ",".join(sorted(data))))
+    mods = _mod_reads.pop(ctx, None)
+    if mods:
+        _out.write("N %s\t%s\n" % (ctx, ",".join(sorted("%s:%s" % m for m in mods if m[0]))))
     users = _users.pop(ctx, None)
     if users:
         _out.write("U %s\t%s\n" % (ctx, ",".join(sorted({_key_of(c) for c in users if c in _class_keys}))))
@@ -274,6 +277,13 @@ DATA = os.environ.get("PROFILE_DATA") == "1"
 # functions are rewritten so that each use of one is noted ("E <ctx>\t<site>,..."; the sites
 # are listed once in a "G" record). See defaults_rewrite.py.
 DEFAULTS = os.environ.get("PROFILE_DEFAULTS") == "1"
+# With PROFILE_MODREADS=1 (a run of its own, no line tracing): every sqlglot module object notes
+# the attributes read from it ("N <ctx>\t<module>:<name>,..."). Code outside a module reaches its
+# globals this way: attribute access, ``from m import name`` at run time, importlib's
+# ``import_module(...).NAME``, ``vars(m)`` (noted as __dict__). Code inside the module reads
+# them as bare names, which the map builder finds in the source.
+MODREADS = os.environ.get("PROFILE_MODREADS") == "1"
+_mod_reads = {}
 _defaults_used = {}
 _dyn_imports = {}
 _data_reads = {}
@@ -408,6 +418,43 @@ def _serve_class_data(cls, before, fixture_ctx):
                 setattr(cls, name, data)
                 _out.write("P %s\t%s\t%s\n" % (tag, path, loader))
                 break
+
+
+def _install_module_recorders():
+    import types
+
+    from sqlglot.dialects.dialect import Dialect
+
+    get = types.ModuleType.__getattribute__
+    names = {}
+    wanted = ("__dict__", "__dir__", "__all__")
+    # The registry scans a dialect module for its Dialect class: dir(module), then getattr of
+    # each name until it finds it. Only classes can be that, so its look at any other value
+    # (and at the namespace as a whole) is not a read of the value.
+    registry_scan = Dialect._try_load.__func__.__code__
+
+    class _RecordingModule(types.ModuleType):
+        def __getattribute__(self, name):
+            value = get(self, name)
+            if name[:2] != "__" or name in wanted:
+                caller = sys._getframe(1)
+                if caller.f_code is registry_scan and (name == "__dict__" or not isinstance(value, type)):
+                    return value
+                if name == "__dict__":
+                    # mock.patch looks the one attribute it patches up in __dict__
+                    if caller.f_code.co_filename.endswith("mock.py") and isinstance(caller.f_locals.get("name"), str):
+                        name = caller.f_locals["name"]
+                item = (names.get(id(self)), name)
+                try:
+                    _mod_reads[_ctx].add(item)
+                except KeyError:
+                    _mod_reads[_ctx] = {item}
+            return value
+
+    for name, module in list(sys.modules.items()):
+        if (name == "sqlglot" or name.startswith("sqlglot.")) and type(module) is types.ModuleType:
+            names[id(module)] = name
+            module.__class__ = _RecordingModule
 
 
 def _record_users():
@@ -817,6 +864,8 @@ def pytest_configure(config):
         _install_weak_loader()
     elif DEFAULTS:
         _install_defaults_loader()
+    elif MODREADS:
+        pass  # attribute reads only, no line tracing
     else:
         mon.set_events(TOOL, mon.events.LINE)
     sys.addaudithook(_audit)
@@ -831,6 +880,8 @@ def pytest_configure(config):
         _record_users()
     if DATA:
         _record_dynamic_imports()
+    if MODREADS:
+        _install_module_recorders()
     _flush("<import>")
     _enter("<other>")
 
@@ -942,7 +993,7 @@ def pytest_runtest_call(item):
         _enter(item.nodeid + "|call")
     else:
         yield
-    for ctx in [c for c in set(_lines) | set(_weak) | set(_attr_reads) | set(_reads) | set(_key_reads) | set(_users) | set(_dyn_imports) | set(_data_reads) | set(_defaults_used) if c.startswith(item.nodeid + "|call")]:
+    for ctx in [c for c in set(_lines) | set(_weak) | set(_attr_reads) | set(_reads) | set(_key_reads) | set(_users) | set(_dyn_imports) | set(_data_reads) | set(_defaults_used) | set(_mod_reads) if c.startswith(item.nodeid + "|call")]:
         _flush(ctx)
 
 
@@ -958,7 +1009,7 @@ def pytest_runtest_teardown(item, nextitem):
 
 def pytest_sessionfinish(session, exitstatus):
     mon.set_events(TOOL, 0)
-    for ctx in list(set(_lines) | set(_reads) | set(_missing) | set(_attr_reads) | set(_weak) | set(_key_reads) | set(_users) | set(_dyn_imports) | set(_data_reads) | set(_defaults_used)):
+    for ctx in list(set(_lines) | set(_reads) | set(_missing) | set(_attr_reads) | set(_weak) | set(_key_reads) | set(_users) | set(_dyn_imports) | set(_data_reads) | set(_defaults_used) | set(_mod_reads)):
         _flush(ctx)
     if WEAK:
         import json
