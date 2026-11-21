@@ -87,32 +87,58 @@ class TestWeakMatch(unittest.TestCase):
 
 
 class TestSelector(unittest.TestCase):
-    """A tiny hand-made map: one module with a runtime line, a comment-only edit, a test set."""
+    """A tiny hand-made map over one real module, so the selector can verify its source."""
 
-    def selector(self):
+    SOURCE = "def f(values):\n    x = 1\n    return values\n"
+
+    def setUp(self):
+        import hashlib
+        import tempfile
+
+        self.root = tempfile.mkdtemp()
+        os.makedirs(os.path.join(self.root, "sqlglot"))
+        with open(os.path.join(self.root, "sqlglot", "m.py"), "w") as f:
+            f.write(self.SOURCE)
+        self.sha1 = hashlib.sha1(self.SOURCE.encode()).hexdigest()
+
+    def selector(self, root=None):
         info = {
-            "kind": bytes([1, 1, 0]), "flags": bytes(3), "sets": {1: 0, 2: 0}, "cols": {}, "argt": {},
-            "cattr": {}, "kattr": {}, "dflt": {}, "checks": set(), "units": [1, 2], "annot": {},
-            "weak": {}, "qsets": {}, "pure": set(), "users": -1, "sha1": "x",
+            "kind": bytes([2, 1, 1, 0]), "flags": bytes(4), "sets": {2: 0, 3: 1}, "cols": {}, "argt": {},
+            "cattr": {}, "kattr": {}, "dflt": {}, "checks": set(), "units": [1, 3], "annot": {},
+            "weak": {}, "qsets": {}, "pure": set(), "users": -1, "sha1": self.sha1,
         }
-        blob = {"files": {"sqlglot/m.py": info}, "reads": {}, "scopes": {}, "sets": [0b101], "fresh": [], "core": []}
-        return bs.Selector(blob, "/nonexistent")
+        blob = {"files": {"sqlglot/m.py": info}, "reads": {}, "scopes": {}, "sets": [0b001, 0b100], "fresh": [], "core": []}
+        return bs.Selector(blob, root or self.root)
 
-    def patch(self, old, new, line=1):
+    def patch(self, old, new, line=2):
         return ("diff --git a/sqlglot/m.py b/sqlglot/m.py\n--- a/sqlglot/m.py\n+++ b/sqlglot/m.py\n"
                 "@@ -%d,1 +%d,1 @@\n-%s\n+%s\n" % (line, line, old, new))
 
+    def run_patch(self, text, root=None):
+        return tuple(self.selector(root).run(text)[:2])
+
     def test_runtime_edit_charges_the_line_set(self):
-        bits, everything = self.selector().run(self.patch("    x = 1", "    x = 2"))[:2]
-        self.assertEqual((bits, everything), (0b101, False))
+        self.assertEqual(self.run_patch(self.patch("    x = 1", "    x = 2")), (0b001, False))
 
     def test_comment_edit_is_free(self):
-        bits, everything = self.selector().run(self.patch("    x = 1", "    x = 1  # Cheap check first"))[:2]
-        self.assertEqual((bits, everything), (0, False))
+        self.assertEqual(self.run_patch(self.patch("    x = 1", "    x = 1  # Cheap check first")), (0, False))
 
     def test_unknown_file_runs_everything(self):
-        text = self.patch("a", "b").replace("sqlglot/m.py", "sqlglot/other.py")
-        self.assertTrue(self.selector().run(text)[1])
+        self.assertTrue(self.run_patch(self.patch("a", "b").replace("sqlglot/m.py", "sqlglot/other.py"))[1])
+
+    def test_without_verified_source_runs_everything(self):
+        self.assertTrue(self.run_patch(self.patch("    x = 1", "    x = 2"), root="/nonexistent")[1])
+
+    def test_new_local_binding_charges_the_whole_function(self):
+        # "values = 1" makes the parameter-shadowing local... here: binding a new name "exp"
+        self.assertEqual(self.run_patch(self.patch("    x = 1", "    values = 1")), (0b101, False))
+
+    def test_plain_unified_diff(self):
+        text = "--- a/sqlglot/m.py\n+++ b/sqlglot/m.py\n@@ -2,1 +2,1 @@\n-    x = 1\n+    x = 2\n"
+        self.assertEqual(self.run_patch(text), (0b001, False))
+
+    def test_syntax_error_runs_everything(self):
+        self.assertTrue(self.run_patch(self.patch("    x = 1", "    x = = 1"))[1])
 
 
 class TestPacking(unittest.TestCase):

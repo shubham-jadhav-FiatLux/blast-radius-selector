@@ -33,7 +33,10 @@ labelled its commits in (`profiling/`):
    `a is b`, `n + 1` and `n - 1` next to a constant `n`, and `x or y` next to `x and y` where
    only the truth value is used. For a chain like `a and b and c`, swapping any one operator
    leaves the result alone only when every operand is truthy, which is what each operand
-   records; conditions split across lines are matched on the line holding the operator. Swaps that always change the result (`==` and `!=`, `in` and
+   records; conditions split across lines are matched on the line holding the operator. That
+   shortcut is only used when the operands after the first cannot have side effects (no calls
+   besides `isinstance`, `len` and the like): `x and self._match(...)` turned into an `or` skips
+   a call that consumes a token even when the truth value comes out the same. Swaps that always change the result (`==` and `!=`, `in` and
    `not in`, `<` and `>=`, dropping a `not`) only record whether the expression was evaluated
    at all, because `a and b == c` can stop before it. The pass records, per test, which swaps would have
    produced a different result. It runs under several hash seeds, and the runs are merged by
@@ -75,6 +78,7 @@ edited block:
 | --- | --- |
 | comment or blank line outside a string literal (Python files only) | none |
 | a comparison, constant in a comparison, condition or `not` swapped for one the weak pass observed | the tests in which that swap would have changed a result; an `is` that can never differ from `==` for the values actually seen costs nothing |
+| an edit that changes which names a function binds (`values = []` -> `exp = []` makes `exp` local everywhere in it) | every test that ran any line of that function |
 | any other edit inside a function body | every test that ran any line of the enclosing statement (with `and`/`or` short-circuiting, a test can depend on a statement without running the edited line), plus the readers of anything that code computed while sqlglot was being imported |
 | inside a lambda that an import-time table holds | the tests that called it |
 | `arg_types` flag flipped | tests that validated a node of an affected class while that argument was missing (`arg_types` values only feed `required_args`); affected classes are the class itself, its subclasses, and classes splicing in its dict |
@@ -92,6 +96,13 @@ a few queries, the selector replays those queries over the patched sources (`src
 and leaves the test out if every one gives the same result table and the same duckdb SQL as at
 the pinned commit (digests in `data/tpcds_reference.json`). This is only tried when it is far
 cheaper than the test, and never when the patch touches `tests/`.
+
+A class attribute, dict entry or default argument whose new value is anything but a plain
+literal (a new name, a call) always gets the import check, whatever the old value was.
+
+Everything that runs patched code in a child process has a deadline and a CPU limit, and all of
+it together has a budget for the batch; a child that runs over is killed, and the selection then
+stays conservative (an import that hangs counts as an import that fails).
 
 When an edited value is computed at import time by code that could fail on the new value, the
 patched modules and their importers are imported again over the pinned sources, in a forked
@@ -130,9 +141,11 @@ of sqlglot at the pinned commit.
 ## Layout
 
 ```
-Dockerfile              submission image: selector, map, pinned sources for compile checks
+Dockerfile              submission image: selector, map, pinned sources (no network needed)
 src/blast_select.py     the selector
-src/fetch_sources.py    build-time download of the pinned sqlglot sources
+data/sqlglot-src.tar.xz the pinned sqlglot sources (Python files and TPC-DS fixtures; MIT),
+                        verified file by file against the map; without them, edits run everything
+src/fetch_sources.py    downloads the same sources from sqlglot's repository (alternative to make sources)
 src/import_baseline.py  build-time list of modules that fail to import even unpatched
 data/map.bin            the map built from the pinned commit
 profiling/              plugins (tracing, weak mutation), source indexer and map builder

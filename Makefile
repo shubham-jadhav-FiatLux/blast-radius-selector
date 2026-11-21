@@ -5,7 +5,7 @@ SQLGLOT ?= ../sqlglot
 OUT ?= out
 SEED ?= 0
 
-.PHONY: build sample profile map reference
+.PHONY: build sample profile map reference sources
 
 # The submission image.
 build:
@@ -26,6 +26,7 @@ profile:
 
 PROFILES ?= $(OUT)/profile/trace_main.txt.gz $(OUT)/profile/trace_max_nodes.txt.gz
 WEAK ?= $(OUT)/profile/weak_main.txt.gz $(OUT)/profile/weak_max_nodes.txt.gz
+WEAK_OUTCOMES ?= $(OUT)/profile/weak_main.json $(OUT)/profile/weak_max_nodes.json
 OUTCOMES ?= $(OUT)/profile/trace_main.json $(OUT)/profile/trace_max_nodes.json
 
 # Reference results of each TPC-DS query of test_execute_tpcds, for single-query re-checks.
@@ -37,5 +38,10 @@ reference:
 map:
 	docker run --rm --user $$(id -u):$$(id -g) -v $(abspath $(SQLGLOT)):/src:ro -v $(CURDIR):/repo -w /repo $(PROFILE_IMAGE) \
 		python profiling/build_map.py --src /src --out data/map.bin \
-		--profile $(PROFILES) --keys $(PROFILES) --weak $(WEAK) --outcomes $(OUTCOMES) \
+		--profile $(PROFILES) --keys $(PROFILES) --weak $(WEAK) --weak-outcomes $(WEAK_OUTCOMES) --outcomes $(OUTCOMES) \
 		--tpcds data/tpcds_reference.json
+
+# The pinned sources the image checks patches against (sqlglot's Python files and TPC-DS fixtures).
+sources:
+	cd $(SQLGLOT) && git ls-files '*.py' LICENSE tests/fixtures/optimizer/tpc-ds | \
+		tar cJf $(CURDIR)/data/sqlglot-src.tar.xz --owner=0 --group=0 --mtime=2026-01-01 -T -

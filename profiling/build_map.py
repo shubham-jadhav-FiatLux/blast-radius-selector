@@ -724,10 +724,19 @@ def main():
                         if charged & pq_bit:
                             qinfected[key].add(OUTSIDE if query is None else query)
         by_site = defaultdict(list)
+        from weak_rewrite import impure_bool_tokens
+
+        impure = {}
         for key in sorted(known):
             rel, ln, c0, c1, text, vtext = key
             if c0 < 0 or rel not in out_files:
                 continue
+            if text in ("and", "or"):
+                if rel not in impure:
+                    with open(os.path.join(src, rel), encoding="utf-8") as f:
+                        impure[rel] = impure_bool_tokens(f.read(), rel)
+                if (ln, c0) in impure[rel]:
+                    continue  # a swap could skip a side effect: plain coverage instead
             bits = infected.get(key, 0)
             if bits == GLOBAL:
                 continue  # it would differ while sqlglot is being imported: no shortcut

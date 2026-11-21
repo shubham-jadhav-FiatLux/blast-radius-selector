@@ -38,11 +38,15 @@ NONE, RUNTIME, IMPORT, MIXED, DOC = 0, 1, 2, 3, 4
 IN_STRING, STRING_AFTER, CONTINUED = 1, 2, 4
 WORKER_MS = 2000
 MAX_WORKERS = 8
-PER_QUERY_BUDGET = 12.0  # seconds of re-checking worth trying instead of a 21 s test
+PER_QUERY_BUDGET = 16.0  # most seconds of re-checking ever worth trying instead of a 21 s test
+CHILD_SECONDS = 20.0  # longest any single patched child may run before it is killed
+TOTAL_CHILD_SECONDS = 100.0  # all patched children together, for the whole batch
 
 CONFIG_FILES = {"pyproject.toml", "setup.cfg", "tox.ini", "pytest.ini", "conftest.py", ".coveragerc"}
 CODING_RE = re.compile(r"^[ \t\f]*#.*?coding[:=]")
 SIMPLE_VALUE_RE = re.compile(r"True|False|None|[-+]?\d+")
+# A replacement value that cannot raise or name anything when evaluated.
+LITERAL_RE = re.compile(r"""\s*(True|False|None|[-+]?\d+(\.\d+)?|"[^"\\]*"|'[^'\\]*')?\s*""")
 ASSIGN_TARGET_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s*(?::[^=]*)?=(?!=)")
 IMPORT_BASELINE = os.environ.get("BLAST_IMPORT_BASELINE", os.path.join(HERE, "import_baseline.txt"))
 
@@ -72,15 +76,14 @@ class Overlay:
         return importlib.util.spec_from_file_location(name, hit[0], submodule_search_locations=hit[1])
 sys.meta_path.insert(0, Overlay)
 sys.path.insert(0, root)
-failed = []
 for name in ["sqlglot"] + wanted:
     if name in skip:
         continue
     try:
         importlib.import_module(name)
     except BaseException:
-        failed.append(name)
-print(",".join(failed))
+        print(name)  # one failure settles it
+        break
 """
 
 
@@ -102,17 +105,26 @@ class Block:
 
 
 class FileChange:
-    __slots__ = ("path", "old_path", "status", "blocks")
+    __slots__ = ("path", "old_path", "status", "blocks", "hunked")
 
     def __init__(self, old_path, path):
         self.old_path = old_path
         self.path = path
         self.status = "modify"
         self.blocks = []
+        self.hunked = False
 
 
 _HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 _DIFF = re.compile(r"^diff --git a/(.*) b/(.*)$")
+
+
+def _header_path(line, prefix):
+    """The path of a ---/+++ header line, without its a/ or b/ prefix or a trailing timestamp."""
+    p = line[4:].split("\t", 1)[0].strip()
+    if p == "/dev/null":
+        return p
+    return p[len(prefix):] if p.startswith(prefix) else p
 
 
 def parse_patch(text):
@@ -153,6 +165,11 @@ def parse_patch(text):
             changes.append(cur)
             block = None
             continue
+        if line.startswith("--- ") and (cur is None or cur.hunked):
+            # a plain unified diff: no "diff --git" line, files start at their "---" header
+            cur = FileChange(None, None)
+            changes.append(cur)
+            block = None
         if cur is None:
             continue
         if line.startswith("@@"):
@@ -160,6 +177,7 @@ def parse_patch(text):
             if not m:
                 cur.status = "unknown"
                 continue
+            cur.hunked = True
             old_ln = int(m.group(1))
             old_left = int(m.group(2)) if m.group(2) is not None else 1
             new_left = int(m.group(4)) if m.group(4) is not None else 1
@@ -175,15 +193,18 @@ def parse_patch(text):
         elif line.startswith("Binary files") or line.startswith("GIT binary patch"):
             cur.status = "binary"
         elif line.startswith("--- "):
-            p = line[4:].strip()
-            if p != "/dev/null" and p.startswith("a/"):
-                cur.old_path = p[2:]
+            p = _header_path(line, "a/")
+            if p == "/dev/null":
+                cur.status = "new"
+            elif p:
+                cur.old_path = p
+                cur.path = cur.path or p
         elif line.startswith("+++ "):
-            p = line[4:].strip()
+            p = _header_path(line, "b/")
             if p == "/dev/null":
                 cur.status = "delete"
-            elif p.startswith("b/"):
-                cur.path = p[2:]
+            elif p:
+                cur.path = p
     return changes
 
 
@@ -286,6 +307,28 @@ def _dedent(lines):
     return out
 
 
+def _bindings(lines):
+    """For every function and comprehension scope in a unit, the names it binds locally,
+    its parameters, and those it declares global or nonlocal."""
+    import symtable
+
+    out = []
+
+    def walk(table, path):
+        if table.get_type() != "module":
+            names = sorted(
+                (sym.get_name(), sym.is_local(), sym.is_parameter(), sym.is_declared_global(), sym.is_nonlocal())
+                for sym in table.get_symbols()
+                if sym.is_local() or sym.is_parameter() or sym.is_declared_global() or sym.is_nonlocal()
+            )
+            out.append((path, table.get_name(), names))
+        for child in table.get_children():
+            walk(child, path + (table.get_name(),))
+
+    walk(symtable.symtable("\n".join(lines), "<unit>", "exec"), ())
+    return out
+
+
 def _compiles(lines, path):
     if lines is None:
         return False
@@ -338,6 +381,9 @@ class Selector:
         self.core = set(blob.get("core", ())) or None
         self._warm = False
         self._baseline = None
+        self.child_seconds = 0.0
+        self.ms = {}
+        self.index_to_number = []
         self.sources = sources
         self._lines = {}
 
@@ -359,11 +405,29 @@ class Selector:
             if self.core is None or any(_module_of(p) in self.core for p in self.import_check):
                 for index in self.fresh:  # these import sqlglot in a fresh interpreter
                     acc[0] |= 1 << index
-        if not acc[1] and acc[0] & self.pq_bit and not acc[3] and acc[2] and self.recheck_queries(acc[2]):
-            acc[0] &= ~self.pq_bit
+        if not acc[1] and acc[0] & self.pq_bit and not acc[3] and acc[2]:
+            if self.recheck_queries(acc[2], self.saving_without(acc[0], self.pq_bit)):
+                acc[0] &= ~self.pq_bit
         return acc
 
-    def recheck_queries(self, queries):
+    def saving_without(self, bits, drop):
+        """Seconds the commit's schedule gets cheaper if the tests in ``drop`` are left out."""
+        if not self.ms:
+            return float("inf")
+
+        def numbers(b):
+            out = set()
+            while b:
+                low = b & -b
+                n = self.index_to_number[low.bit_length() - 1]
+                if n >= 0:
+                    out.add(n)
+                b ^= low
+            return out
+
+        return (_cost(split(numbers(bits), self.ms), self.ms) - _cost(split(numbers(bits & ~drop), self.ms), self.ms)) / 1000
+
+    def recheck_queries(self, queries, saving=float("inf")):
         """True if the per-query test still passes for every query the edit can reach: each
         one, run over the patched sources, gives the same result table and the same duckdb SQL
         as at the pinned commit. Only tried when that is much cheaper than running the test."""
@@ -375,8 +439,10 @@ class Selector:
         estimate = sum(ref["seconds"][k] for k in queries)
         if any(ref["rows"][k] is not None for k in queries):
             estimate += ref["load"]
-        if estimate > PER_QUERY_BUDGET:
-            log("per-query test: %d queries, about %.1f s to re-check; running it whole" % (len(queries), estimate))
+        # what leaving the test out actually saves on this commit's schedule
+        if estimate > PER_QUERY_BUDGET or estimate > 0.6 * saving:
+            log("per-query test: %d queries, about %.1f s to re-check for %.1f s saved; running it whole"
+                % (len(queries), estimate, saving))
             return False
         if not os.path.isdir(os.path.join(self.sources, "tests", "fixtures", "optimizer", "tpc-ds")):
             return False
@@ -395,7 +461,7 @@ class Selector:
                 log("per-query test: queries", differ, "change with this patch")
             return not differ
 
-        ok = self.in_patched_child(same)
+        ok = self.in_patched_child(same, timeout=min(CHILD_SECONDS, 3 * estimate + 3))
         if ok:
             log("per-query test passes for queries", sorted(queries), "- left out")
         return ok
@@ -428,8 +494,12 @@ class Selector:
             try:
                 if hasattr(os, "fork") and self.forked_check(overlay, wanted):
                     return True
+            except TimeoutError:
+                return False  # an import that hangs breaks every importer
             except Exception as error:  # noqa: BLE001
                 log("forked import check unavailable, using a fresh interpreter:", repr(error))
+            if self.child_seconds >= TOTAL_CHILD_SECONDS:
+                return False
             return self.fresh_check(overlay, wanted)
         except Exception as error:  # noqa: BLE001
             log("import check failed to run:", repr(error))
@@ -437,7 +507,7 @@ class Selector:
         finally:
             shutil.rmtree(overlay, ignore_errors=True)
 
-    def in_patched_child(self, check):
+    def in_patched_child(self, check, timeout=CHILD_SECONDS):
         """Runs ``check()`` in a forked child with the patched modules (and their importers)
         imported again over the pinned sources. False on any error or without fork."""
         if not hasattr(os, "fork") or not os.path.isdir(self.sources):
@@ -460,14 +530,14 @@ class Selector:
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
                 with open(dest, "w", encoding="utf-8") as f:
                     f.write(text)
-            return self.forked_check(overlay, wanted, check)
+            return self.forked_check(overlay, wanted, check, timeout)
         except Exception as error:  # noqa: BLE001
             log("patched child failed to run:", repr(error))
             return False
         finally:
             shutil.rmtree(overlay, ignore_errors=True)
 
-    def forked_check(self, overlay, wanted, check=None):
+    def forked_check(self, overlay, wanted, check=None, timeout=CHILD_SECONDS):
         """Imports sqlglot once in this process, then re-imports the patched modules (and the
         modules that import them) in a forked child, which costs far less than a fresh start."""
         if not self._warm:
@@ -480,12 +550,19 @@ class Selector:
                 return False
             finally:
                 sys.stdout = stdout
+        limit = min(timeout, TOTAL_CHILD_SECONDS - self.child_seconds)
+        if limit <= 0.5:
+            raise TimeoutError("no time left for patched children")
         sys.stdout.flush()
         sys.stderr.flush()
         pid = os.fork()
         if pid == 0:
             status = 1
             try:
+                import resource
+
+                cpu = int(limit) + 1
+                resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu + 1))
                 os.dup2(os.open(os.devnull, os.O_WRONLY), 1)
                 sys.stdout = sys.stderr
                 import importlib
@@ -507,8 +584,28 @@ class Selector:
                 status = 1
             finally:
                 os._exit(status)
-        _, code = os.waitpid(pid, 0)
-        return os.WIFEXITED(code) and os.WEXITSTATUS(code) == 0
+        return self.reap(pid, limit)
+
+    def reap(self, pid, limit):
+        """Waits for a child for at most ``limit`` seconds; a child still running then (a
+        patched loop that never ends, say) is killed and counts as a failure."""
+        import signal
+        import time
+
+        start = time.monotonic()
+        try:
+            while True:
+                done, code = os.waitpid(pid, os.WNOHANG)
+                if done:
+                    return os.WIFEXITED(code) and os.WEXITSTATUS(code) == 0
+                if time.monotonic() - start > limit:
+                    os.kill(pid, signal.SIGKILL)
+                    os.waitpid(pid, 0)
+                    log("patched child ran past %.0f s; stopped" % limit)
+                    raise TimeoutError("patched child timed out")
+                time.sleep(0.002)
+        finally:
+            self.child_seconds += time.monotonic() - start
 
     def fresh_check(self, overlay, wanted):
         import subprocess
@@ -520,7 +617,7 @@ class Selector:
             ],
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=max(1.0, min(30.0, TOTAL_CHILD_SECONDS - self.child_seconds)),
         )
         return done.returncode == 0 and not done.stdout.strip()
 
@@ -702,6 +799,32 @@ class Selector:
                     return sid, q
         return None
 
+    def binding_changes(self, path, info, blocks, acc):
+        """Assigning to a name makes it local to the whole function, so ``x = []`` turned into
+        ``exp = []`` breaks every read of ``exp`` in that function, wherever the edit sits.
+        If an edit changes which names a function binds (or declares global/nonlocal), every
+        test that ran any line of that function is charged."""
+        lines = self.source_lines(path, info)
+        units = self.units_for(info, blocks)
+        if lines is None or units is None:
+            return
+        for (u0, u1), inner in units.items():
+            old = _dedent(lines[u0 - 1 : u1])
+            new = _dedent(_apply(lines, inner, u0, u1))
+            if old is None or new is None:
+                continue
+            try:
+                same = _bindings(old) == _bindings(new)
+            except (SyntaxError, ValueError):
+                same = False
+            if same:
+                continue
+            log(path, "changes which names a function binds; charging the whole function")
+            for ln in range(u0, u1 + 1):
+                self.charge(acc, info["sets"].get(ln, NO_TESTS))
+                if ln in info["checks"]:
+                    self.import_check.add(path)
+
     def compiles(self, path, info, blocks):
         """Syntax check of the patched file; an edit that breaks the syntax breaks every
         importer. Each edit is checked by compiling just the unit around it (a module-level
@@ -756,11 +879,18 @@ class Selector:
         live = [b for b in blocks if not self.inert(info, b) and not self.pure_duplicate(path, info, b)]
         if not live:
             return
+        if self.source_lines(path, info) is None:
+            # no verified pinned source: nothing can be compiled or imported to back a narrow
+            # answer, so treat the edit as one that runs when the module is imported
+            log(path, "has no verified source to check against")
+            self.module_level(path, info, acc)
+            return
         if not self.compiles(path, info, blocks):
             log(path, "does not compile after the patch")
             self.module_level(path, info, acc)
             return
         sets = info["sets"]
+        self.binding_changes(path, info, live, acc)
         for b in live:
             pairs = len(b.old) == len(b.new)
             if b.old:
@@ -808,7 +938,8 @@ class Selector:
                     if hit:
                         for sid, check in hit:
                             self.charge(acc, sid)
-                            if check:
+                            # defaults are evaluated at import: a new name or call may fail there
+                            if check or not LITERAL_RE.fullmatch(cols[3]):
                                 self.import_check.add(path)
                         continue
                 if k in (IMPORT, MIXED) and cols is not None and ln in info["cattr"]:
@@ -820,7 +951,8 @@ class Selector:
                         if entry:
                             sid = entry[0][2]  # the value of one dict entry: whoever looked up its key
                         self.charge(acc, sid)  # the value changed
-                        if check:
+                        # whether import-time code can fail depends on the new value, not the old
+                        if check or not LITERAL_RE.fullmatch(cols[3]):
                             self.import_check.add(path)
                         continue
                     renamed = ASSIGN_TARGET_RE.match(b.new[i])
@@ -850,6 +982,11 @@ class Selector:
 
 
 # ----------------------------------------------------------------------------- packing
+def _cost(workers, ms):
+    workers = [w for w in workers if w]
+    return max(sum(ms[t] for t in w) for w in workers) + WORKER_MS * len(workers) if workers else 0
+
+
 def split(numbers, ms):
     """Spread tests over 1..8 workers, minimising the busiest worker plus 2 s per worker."""
     if not numbers:
@@ -943,6 +1080,8 @@ def main():
         if unknown:
             log(len(unknown), "tests are not in the map; they run on every commit")
         selector = Selector(blob, SOURCE_ROOT)
+        selector.ms = ms
+        selector.index_to_number = index_to_number
     except Exception as error:  # noqa: BLE001
         log("map unavailable, running everything:", repr(error))
 

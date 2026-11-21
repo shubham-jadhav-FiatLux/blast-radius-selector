@@ -238,6 +238,47 @@ def _with_constant(op, side, value):
     return lambda a, b: op(a, value)
 
 
+_EFFECTS = (ast.Call, ast.NamedExpr, ast.Await, ast.Yield, ast.YieldFrom)
+# Calls that only inspect their arguments: skipping one cannot change program state.
+_PURE_FUNCS = {"isinstance", "issubclass", "len", "type", "bool", "callable", "hasattr", "id"}
+_PURE_METHODS = {"startswith", "endswith", "isdigit", "isalpha", "isalnum", "isspace", "isupper", "islower"}
+
+
+def _has_effect(node):
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Call):
+            fn = sub.func
+            if isinstance(fn, ast.Name) and fn.id in _PURE_FUNCS:
+                continue
+            if isinstance(fn, ast.Attribute) and fn.attr in _PURE_METHODS:
+                continue
+            return True
+        if isinstance(sub, _EFFECTS):
+            return True
+    return False
+
+
+def impure_bool_tokens(source, rel):
+    """(line, col0) of every and/or token whose chain has an operand after the first that may
+    have side effects. Swapping such an operator can skip a call the program relied on (for
+    example a parser's ``self._match(...)`` consuming a token) even when the truth value comes
+    out the same, so the truth-value shortcut does not apply to it."""
+    tree = ast.parse(source)
+    finder = _Rewriter(rel, source.split("\n"), set())
+    out = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.BoolOp):
+            continue
+        if not any(_has_effect(value) for value in node.values[1:]):
+            continue
+        word = "and" if isinstance(node.op, ast.And) else "or"
+        for a, b in zip(node.values, node.values[1:]):
+            where = finder._token_between(a, b, word)
+            if where is not None:
+                out.add((where[0], where[1]))
+    return out
+
+
 def rewrite(source, rel, filename):
     """Compiles ``source`` with every comparison and boolean swap instrumented."""
     tree = ast.parse(source, filename)
