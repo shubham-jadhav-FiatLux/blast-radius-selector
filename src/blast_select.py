@@ -1225,13 +1225,23 @@ class Selector:
                         continue
                 if k in (IMPORT, MIXED) and cols is not None and ln in info["cattr"]:
                     target = ASSIGN_TARGET_RE.match(b.old[i])
-                    sid, check = info["cattr"][ln]
+                    # (set, check[, queries of the per-query test, those after planning, steps])
+                    sid, check, *qs = info["cattr"][ln]
+                    queries = tuple(qs[0]) if qs else None
+                    after = self.back_of_known(queries, qs[1]) if qs else None
+                    steps = qs[2] if qs else 0
                     if target is None or cols[0] >= target.end():
                         a, z = cols[0], max(cols[1], cols[0] + 1)
                         entry = [e for e in info.get("kattr", {}).get(ln, ()) if e[0] <= a and z <= e[1]]
                         if entry:
                             sid = entry[0][2]  # the value of one dict entry: whoever looked up its key
-                        self.charge(acc, sid)  # the value changed
+                            if len(entry[0]) > 3:
+                                queries = tuple(entry[0][3])
+                                after = self.back_of_known(queries, entry[0][4])
+                                steps = entry[0][5]
+                            else:
+                                queries, after, steps = None, None, 0
+                        self.charge(acc, sid, queries, after, steps)  # the value changed
                         # whether import-time code can fail depends on the new value, not the old
                         if check or not LITERAL_RE.fullmatch(cols[3]):
                             self.import_check.add(path)
@@ -1239,7 +1249,7 @@ class Selector:
                     renamed = ASSIGN_TARGET_RE.match(b.new[i])
                     if renamed is None or renamed.group(1) == target.group(1):
                         # the assignment was dropped or rewritten in place: same attribute
-                        self.charge(acc, sid)
+                        self.charge(acc, sid, queries, after, steps)
                         self.import_check.add(path)
                         continue
                 if not b.old and k in (NONE, DOC) and not code_lines(b.new):
@@ -1253,7 +1263,7 @@ class Selector:
                         continue
                 if not pairs and k in (IMPORT, MIXED) and self.whole_entry_edit(info, b):
                     # whole lines added to or removed from the middle of a class-level table
-                    sid, _check = info["cattr"][ln]
+                    sid, _check, *_ = info["cattr"][ln]
                     self.charge(acc, sid)
                     self.import_check.add(path)
                     continue

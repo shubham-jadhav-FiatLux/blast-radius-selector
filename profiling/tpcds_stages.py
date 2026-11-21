@@ -9,7 +9,8 @@ transpile(sql, write="duckdb").
 Everything up to the plan takes about 0.1 s a query; running the plan is most of the test's 21 s.
 This records, per query, the lines that run in the steps up to the plan ("front") and the lines
 that run anywhere else ("back"): the executor, ensure_tables, the body of execute() itself and
-the result's pickle round trip. It also records, for every front line, in which steps it ran
+the result's pickle round trip, and the same for reads of sqlglot class attributes ("attrs",
+through the main profile's read recorders). It also records, for every front line, in which steps it ran
 ("modes"): parse, pickle, tables (find_tables), pre (the rest of execute() and optimize()
 around the rules), each optimizer rule, plan, duckdb. An edit only the front reaches can then be
 re-checked by comparing plans, and an edit only some rules reach by re-running those rules alone.
@@ -54,6 +55,25 @@ def main():
 
     sqls = list(load_sql_fixture_pairs(tpcds_check.FIXTURE))
     schema, tables = pickle.loads(pickle.dumps((TPCDS_SCHEMA, tpcds_check._tables(FIXTURES_DIR, TPCDS_SCHEMA))))
+
+    # Class attribute reads, by step, with the main profile's recorders: every sqlglot class
+    # attribute is served through a descriptor that notes the current context (here, the step).
+    import importlib
+    import io
+    import pkgutil
+
+    import sqlglot
+
+    for info in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
+        if not info.name.endswith(".__main__"):
+            try:
+                importlib.import_module(info.name)
+            except Exception:  # noqa: BLE001
+                pass
+    import trace_plugin
+
+    trace_plugin._out = io.StringIO()
+    trace_plugin._install_read_recorders()
     execute_lines = sorted({ln for _, _, ln in executor.execute.__code__.co_lines() if ln})
     optimize_code = optimizer.optimize.__code__
     prefix = root + os.sep
@@ -90,6 +110,7 @@ def main():
     def set_mode(mode):
         previous = state["mode"]
         state["mode"] = mode
+        trace_plugin._ctx = mode or "<other>"
         mon.set_events(FRONT_TOOL, mon.events.LINE if mode not in (None, "back") else 0)
         mon.set_events(BACK_TOOL, mon.events.LINE if mode == "back" else 0)
         return previous
@@ -150,7 +171,7 @@ def main():
         pickle.loads(pickle.dumps(table))
         within("duckdb", transpile, sql, write="duckdb")
 
-    out = {"front": {}, "back": {}, "modes": {}, "executed": [], "rules": [r.__name__ for r in optimizer.RULES]}
+    out = {"front": {}, "back": {}, "modes": {}, "attrs": {}, "executed": [], "rules": [r.__name__ for r in optimizer.RULES]}
     for k, (meta, sql, _) in enumerate(sqls):
         if meta.get("execute"):
             out["executed"].append(k)
@@ -167,11 +188,14 @@ def main():
                 executor.PythonExecutor.__init__ = executor_init
                 executor.Plan = plan
                 optimizer.optimize.__defaults__ = tuple(defaults)
+                trace_plugin._attr_reads.clear()
                 for _ in range(2):  # cold, then warm
                     set_mode("back")
                     run_query(meta, sql)
                 set_mode(None)
                 result = {
+                    "attrs": {mode: sorted(tags) for mode, tags in trace_plugin._attr_reads.items()
+                              if mode not in ("<other>", None)},
                     "front": sorted({(f[len(prefix):], ln, m) for f, ln, m in front_seen if f.startswith(prefix)}),
                     "back": sorted({(f[len(prefix):], ln) for f, ln in back_seen if f.startswith(prefix)}),
                 }
@@ -194,12 +218,19 @@ def main():
             out["modes"].setdefault(rel, {}).setdefault(ln, set()).add(mode)
         for rel, ln in result["back"]:
             out["back"].setdefault(rel, {}).setdefault(ln, set()).add(k)
+        for mode, tags in result["attrs"].items():
+            for tag in tags:
+                entry = out["attrs"].setdefault(tag, {"front": set(), "back": set(), "modes": set()})
+                entry["back" if mode == "back" else "front"].add(k)
+                if mode != "back":
+                    entry["modes"].add(mode)
         if meta.get("execute"):
             for ln in execute_lines:
                 out["back"].setdefault("sqlglot/executor/__init__.py", {}).setdefault(ln, set()).add(k)
         print("query", k, "front", len(result["front"]), "back", len(result["back"]), file=sys.stderr)
     for name in ("front", "back", "modes"):
         out[name] = {rel: {str(ln): sorted(v) for ln, v in lines.items()} for rel, lines in out[name].items()}
+    out["attrs"] = {tag: {k: sorted(v) for k, v in e.items()} for tag, e in out["attrs"].items()}
     with open(target, "w") as f:
         json.dump(out, f)
 

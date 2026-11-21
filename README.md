@@ -113,6 +113,10 @@ The test is left out only when every reached query passes, the re-check is far c
 the test, and the patch does not touch `tests/`. Plan digests and checkpoints are computed with a
 fixed hash seed in the image that uses them.
 
+Edits to class attributes and to entries of class-level dicts get the same re-check. The
+profile records, per query, which class attributes the test reads, and the stage profiler
+records whether each is read before or after the plan and in which steps.
+
 Much of the parser and tokenizer also runs while sqlglot is being imported, to parse SQL
 templates and build tables. For such a line the per-query answer holds only if what the import
 computed with it is unchanged, so the re-check first digests those values (the class attributes

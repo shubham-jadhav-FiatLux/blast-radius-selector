@@ -25,7 +25,7 @@ from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from import_effects import MODULE, ImportEffects, module_name  # noqa: E402
+from import_effects import ANY, MODULE, ImportEffects, module_name  # noqa: E402
 from source_index import DOC, IMPORT, MIXED, NONE, RUNTIME, index_source  # noqa: E402
 
 NO_TESTS = -1
@@ -607,13 +607,44 @@ def main():
     # ------------------------------------------------------------- import-time effects
     attr_reads = defaultdict(int)
     attr_global = set()
+    attr_queries = defaultdict(set)  # tag -> queries of the per-query test that read it (or OUTSIDE)
     for ctx, entry in contexts.items():
         charged = tests.resolve(ctx)
+        query = int(ctx[len(pq_prefix):]) if ctx.startswith(pq_prefix) else None
         for tag in entry["attrs"]:
             if charged == GLOBAL:
                 attr_global.add(tag)
             else:
                 attr_reads[tag] |= charged
+                if charged & pq_bit:
+                    # a run that did not split the test only says "somewhere in it"
+                    attr_queries[tag].add("unsplit" if ctx.endswith("|call#unsplit") else (OUTSIDE if query is None else query))
+    # and when, per query, the TPC-DS replay read each attribute (before or after the plan, in
+    # which steps): tag -> (front queries, back queries, steps mask)
+    stage_attrs = {}
+    if args.tpcds_stages and pq_index is not None:
+        bit = {name: 1 << i for i, name in enumerate(TPCDS_STEPS)}
+        for tag, e in stages.get("attrs", {}).items():
+            stage_attrs[tag] = (set(e["front"]), set(e["back"]), sum(bit.get(m, bit["pre"]) for m in set(e["modes"])))
+
+    def attr_query_sets(pairs):
+        """(queries, back queries, steps) of the per-query test for an edit that can change the
+        given (owner, attribute) pairs, or None when that is not known query by query."""
+        queries, back, steps = set(), set(), 0
+        for o, n in pairs:
+            if o in (MODULE, ANY):
+                return None
+            tag = "%s:%s" % (o, n)
+            seen = attr_queries.get(tag, set())
+            front_q, back_q, mask = stage_attrs.get(tag, (set(), set(), 0))
+            split = {q for q in seen if isinstance(q, int) and q >= 0}
+            if OUTSIDE in seen or ("unsplit" in seen and not split and not front_q and not back_q):
+                return None  # read by the per-query test outside any one query (or only seen whole)
+            seen = split
+            queries |= seen | front_q | back_q
+            back |= back_q | {q for q in seen if q not in front_q and q not in back_q}
+            steps |= mask
+        return tuple(sorted(queries)), tuple(sorted(back & queries)), steps
 
     mentions = defaultdict(list)
     for rel, ix in files.items():
@@ -982,7 +1013,10 @@ def main():
                     if k is None:
                         continue
                     owner = "%s.%s" % (module_name(rel), qualname)
-                    out.append((c0, c1, table.add(effects.tests_for_key(owner, attr, k, keyed, displays))))
+                    sid = table.add(effects.tests_for_key(owner, attr, k, keyed, displays))
+                    qs = attr_query_sets(effects.affected(owner, attr, values_only=True)) \
+                        if sid >= 0 and table.sets[sid] & pq_bit else None
+                    out.append((c0, c1, sid) + (qs if qs is not None else ()))
                 if out:
                     kattr[ln] = out
         if rel.startswith("sqlglot/") and meta["families"]:
@@ -990,6 +1024,7 @@ def main():
             for ln, entries in ix["classattr"].items():
                 bits = 0
                 check = ln not in pure
+                pairs = set()
                 for qualname, name in entries:
                     owner = "%s.%s" % (module_name(rel), qualname) if qualname else MODULE
                     got = effects.tests_for(owner, name)
@@ -997,10 +1032,15 @@ def main():
                         bits = GLOBAL
                         break
                     bits |= got
+                    affected = effects.affected(owner, name)
+                    pairs |= affected
                     # import-time code that derives from the value could fail on the new value
-                    if len(effects.affected(owner, name)) > 1:
+                    if len(affected) > 1:
                         check = True
-                cattr[ln] = (table.add(bits), check)
+                sid = table.add(bits)
+                qs = attr_query_sets(pairs) if sid >= 0 and table.sets[sid] & pq_bit else None
+                # (set, check[, queries of the per-query test, those after planning, steps])
+                cattr[ln] = (sid, check) + (qs if qs is not None else ())
         for ln, entries in ix["defaults"].items():
             # a default reaches whoever ran the function's body, or, when the default-use
             # profile covers it, whoever called the function without that argument:
