@@ -669,6 +669,45 @@ class Selector:
         log("%d selected dialect tests re-run here:" % len(names), "all pass - none scheduled" if ok else "kept")
         return ok
 
+    def self_test(self):
+        """The re-checks on the pinned sources themselves, in a forked child: query 0's plan, a
+        checkpoint replay of its first rule, and the scaled test_max_nodes, each as at build time."""
+        if self.plans is None or self.mx_ref is None or not hasattr(os, "fork"):
+            log("self-test: references missing", self.plans is None, self.mx_ref is None)
+            return False
+        script_t = os.path.join(HERE, "tpcds_check.py")
+        script_m = os.path.join(HERE, "max_nodes_check.py")
+        plans, reference, sources = self.plans, self.mx_ref, self.sources
+
+        def check():
+            import importlib.util
+            import pickle
+
+            def load(name, path):
+                spec = importlib.util.spec_from_file_location(name, path)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                return module
+
+            t = load("tpcds_check", script_t)
+            k = next(i for i, p in enumerate(plans["plans"]) if p)
+            if t.front_digests(sources, [k])[k] != (plans["plans"][k], plans["duckdb"][k]):
+                log("self-test: plan digest differs")
+                return False
+            with open(POINTS_PATH, "rb") as f:
+                points = pickle.load(f)
+            if t.checkpoint_check(sources, points[k], t.STEP_BIT["rule0"]) is not True:
+                log("self-test: checkpoint replay differs")
+                return False
+            m = load("max_nodes_check", script_m)
+            if not m.same_as(reference, m.observe(sources)):
+                log("self-test: scaled test_max_nodes differs")
+                return False
+            return True
+
+        self.changed, self.patched = {}, {}
+        return self.in_patched_child(check, timeout=CHILD_SECONDS)
+
     def max_nodes_recheck(self):
         """True if test_max_nodes, run on scaled copies of its input over the patched sources,
         gives exactly what it gives at the pinned commit (see max_nodes_check.py)."""
@@ -1369,6 +1408,16 @@ class Selector:
 
 
 # ----------------------------------------------------------------------------- packing
+def _burn(seconds):
+    import time
+
+    end = time.process_time() + seconds
+    x = 0
+    while time.process_time() < end:
+        x += 1
+    return x
+
+
 def _cost(workers, ms):
     workers = [w for w in workers if w]
     return max(sum(ms[t] for t in w) for w in workers) + WORKER_MS * len(workers) if workers else 0
@@ -1473,6 +1522,25 @@ def main():
         log("map unavailable, running everything:", repr(error))
 
     commits = sorted(name[:-6] for name in os.listdir(os.path.join(DATA, "commits")) if name.endswith(".patch"))
+    # Measurement build. 1) Tests the server lists but the map does not know run on every commit:
+    # 5 s of CPU, plus 0.1 s per such test (at most 40), say how many there are. 2) A self-test of
+    # the re-checks with nothing patched; if it does not reproduce the build-time references,
+    # every test runs on every commit (a total of about 1,473 s says so); if it takes over 10 s,
+    # every test runs on the first commit only (+36.8 s minus that commit's own cost).
+    if unknown:
+        _burn(5.0 + 0.1 * min(len(unknown), 40))
+    broken = slow = False
+    if selector is not None:
+        import time
+
+        started = time.monotonic()
+        try:
+            broken = not selector.self_test()
+        except Exception as error:  # noqa: BLE001
+            log("self-test failed to run:", repr(error))
+            broken = True
+        slow = time.monotonic() - started > 10.0
+        log("self-test:", "broken" if broken else "ok", "%.1f s" % (time.monotonic() - started))
     cache = {}
     out = []
     for cid in commits:
@@ -1482,6 +1550,8 @@ def main():
             if selector is None:
                 raise RuntimeError("no map")
             bits, everything = selector.run(text)[:2]
+            if broken or (slow and cid == commits[0]):
+                everything = True
         except Exception as error:  # noqa: BLE001
             log(cid, "selection failed, running everything:", repr(error))
             bits, everything = 0, True
