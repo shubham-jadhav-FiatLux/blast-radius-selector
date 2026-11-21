@@ -1284,6 +1284,7 @@ def main():
         listing = json.load(f)
     tests = listing["tests"]
     ms = {t["number"]: int(round(t["seconds"] * 1000)) for t in tests}
+    listing_ids = {t["number"]: t["id"] for t in tests}
     every = sorted(ms)
 
     selector = None
@@ -1331,8 +1332,31 @@ def main():
                         chosen.add(number)
                     bits ^= low
             workers = cache[key] = split(chosen, ms)
+        # Measurement build: test_max_nodes and test_execute_tpcds are never run, and each
+        # removal leaves a trace in CPU time (0.25 s for test_max_nodes, 2.5 s for
+        # test_execute_tpcds), so the board tells how often each was chosen and, through
+        # misses, how often it was needed.
+        big = {n for n, i in listing_ids.items() if i in (
+            "tests/test_parser.py::TestParser::test_max_nodes", "tests/test_executor.py::TestExecutor::test_execute_tpcds")}
+        held = {t for w in workers for t in w}
+        if held & big:
+            burn = 0.0
+            for n in held & big:
+                burn += 0.25 if listing_ids[n].endswith("test_max_nodes") else 2.5
+            _burn(burn)
+            workers = split(held - big, ms) if held - big else []
         out.append(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")))
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
+
+
+def _burn(seconds):
+    import time
+
+    end = time.process_time() + seconds
+    x = 0
+    while time.process_time() < end:
+        x += 1
+    return x
 
 
 if __name__ == "__main__":
