@@ -42,7 +42,7 @@ MAX_WORKERS = 8
 CONFIG_FILES = {"pyproject.toml", "setup.cfg", "tox.ini", "pytest.ini", "conftest.py", ".coveragerc"}
 CODING_RE = re.compile(r"^[ \t\f]*#.*?coding[:=]")
 SIMPLE_VALUE_RE = re.compile(r"True|False|None|[-+]?\d+")
-ASSIGN_TARGET_RE = re.compile(r"^\s*[A-Za-z_]\w*\s*(?::[^=]*)?=(?!=)")
+ASSIGN_TARGET_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s*(?::[^=]*)?=(?!=)")
 IMPORT_BASELINE = os.environ.get("BLAST_IMPORT_BASELINE", os.path.join(HERE, "import_baseline.txt"))
 
 # Imports the given sqlglot modules with some files replaced by patched copies, and prints the
@@ -244,6 +244,17 @@ def changed_columns(old, new):
     return p, len(old) - s, old[p : len(old) - s], new[p : len(new) - s]
 
 
+class _Span:
+    """A stand-in block covering old lines start .. start+count-1."""
+
+    __slots__ = ("start", "old", "new")
+
+    def __init__(self, start, count):
+        self.start = start
+        self.old = [None] * count
+        self.new = []
+
+
 def _apply(lines, blocks, first, last):
     """Lines first..last of the pinned file with the given blocks applied."""
     out = []
@@ -321,6 +332,7 @@ class Selector:
         self.scopes = blob["scopes"]
         self.sets = blob["sets"]
         self.fresh = blob.get("fresh", [])
+        self.core = set(blob.get("core", ())) or None
         self._warm = False
         self._baseline = None
         self.sources = sources
@@ -340,8 +352,9 @@ class Selector:
             if not self.imports_cleanly():
                 log("patched modules no longer import:", sorted(self.import_check))
                 acc[1] = True
-            for index in self.fresh:
-                acc[0] |= 1 << index
+            if self.core is None or any(_module_of(p) in self.core for p in self.import_check):
+                for index in self.fresh:  # these import sqlglot in a fresh interpreter
+                    acc[0] |= 1 << index
         return acc
 
     def imports_cleanly(self):
@@ -526,6 +539,43 @@ class Selector:
             return False
         return code_lines(b.old) == code_lines(b.new)
 
+    def pure_duplicate(self, path, info, b):
+        """True if the block repeats whole class or module level assignments of plain values
+        (``X = True`` twice in a row), which leaves every value as it was."""
+        lines = self.source_lines(path, info)
+        if lines is None:
+            return False
+        if b.old and b.new == b.old + b.old:
+            first, count = b.start, len(b.old)
+        elif not b.old and b.new and lines[b.start - 1 - len(b.new) : b.start - 1] == b.new:
+            first, count = b.start - len(b.new), len(b.new)
+        elif not b.old and b.new and lines[b.start - 1 : b.start - 1 + len(b.new)] == b.new:
+            first, count = b.start, len(b.new)
+        else:
+            return False
+        units = self.units_for(info, [_Span(first, count)])
+        if units is None or list(units) != [(first, first + count - 1)]:
+            return False  # not exactly one complete statement
+        pure = info.get("pure") or ()
+        return all(ln in pure and ln in info["cattr"] for ln in range(first, first + count))
+
+    def dropped_statements(self, info, b):
+        """Set ids of the class or module level assignments a pure deletion removes, if it
+        removes whole assignment statements and nothing else; otherwise None."""
+        units = self.units_for(info, [b])
+        if units is None:
+            return None
+        sids = []
+        for (u0, u1), _inner in units.items():
+            if not (b.start <= u0 and u1 <= b.start + len(b.old) - 1):
+                return None
+        for ln in range(b.start, b.start + len(b.old)):
+            entry = info["cattr"].get(ln)
+            if entry is None or not ASSIGN_TARGET_RE.match(b.old[0]):
+                return None
+            sids.append(entry[0])
+        return sids
+
     @staticmethod
     def whole_entry_edit(info, b):
         """True if a block only adds or removes whole lines strictly inside one class or module
@@ -614,7 +664,7 @@ class Selector:
         kind = info["kind"]
         n = len(kind)
         self.changed[path] = (info, blocks)
-        live = [b for b in blocks if not self.inert(info, b)]
+        live = [b for b in blocks if not self.inert(info, b) and not self.pure_duplicate(path, info, b)]
         if not live:
             return
         if not self.compiles(path, info, blocks):
@@ -632,6 +682,10 @@ class Selector:
                 if not 1 <= ln <= n:
                     continue
                 k = kind[ln - 1]
+                if pairs and ln in info.get("annot", ()):
+                    a0, a1, _o, _n = changed_columns(b.old[i], b.new[i])
+                    if any(c0 <= a0 and max(a1, a0 + 1) <= c1 for c0, c1 in info["annot"][ln]):
+                        continue  # an annotation nothing evaluates
                 if k in (RUNTIME, MIXED) and pairs and len(b.old) == 1 and ln in info["weak"]:
                     sid = self.weak_match(info["weak"][ln], b.old[0], b.new[0])
                     if sid is not None:
@@ -667,16 +721,29 @@ class Selector:
                             if check:
                                 self.import_check.add(path)
                         continue
-                if k == IMPORT and cols is not None and ln in info["cattr"]:
+                if k in (IMPORT, MIXED) and cols is not None and ln in info["cattr"]:
                     target = ASSIGN_TARGET_RE.match(b.old[i])
+                    sid, check = info["cattr"][ln]
                     if target is None or cols[0] >= target.end():
-                        sid, check = info["cattr"][ln]
-                        self.charge(acc, sid)
+                        self.charge(acc, sid)  # the value changed
                         if check:
                             self.import_check.add(path)
                         continue
+                    renamed = ASSIGN_TARGET_RE.match(b.new[i])
+                    if renamed is None or renamed.group(1) == target.group(1):
+                        # the assignment was dropped or rewritten in place: same attribute
+                        self.charge(acc, sid)
+                        self.import_check.add(path)
+                        continue
                 if not b.old and k in (NONE, DOC) and not code_lines(b.new):
                     continue
+                if not b.new and k in (IMPORT, MIXED):
+                    dropped = self.dropped_statements(info, b)
+                    if dropped is not None:
+                        for sid in dropped:
+                            self.charge(acc, sid)
+                        self.import_check.add(path)
+                        continue
                 if not pairs and k in (IMPORT, MIXED) and self.whole_entry_edit(info, b):
                     # whole lines added to or removed from the middle of a class-level table
                     sid, _check = info["cattr"][ln]

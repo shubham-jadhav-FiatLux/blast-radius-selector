@@ -29,8 +29,9 @@ labelled its commits in (`profiling/`):
    edits. Every comparison and condition inside a sqlglot function is rewritten so that it
    evaluates the swapped form next to the real one: `a <= b` next to `a < b`, `a == b` next to
    `a is b`, `n + 1` and `n - 1` next to a constant `n`, and `x or y` next to `x and y` where
-   only the truth value is used. Each `not` records whether it was evaluated at all, because
-   `a and not b` can stop before it. The pass records, per test, which swaps would have
+   only the truth value is used. Swaps that always change the result (`==` and `!=`, `in` and
+   `not in`, `<` and `>=`, dropping a `not`) only record whether the expression was evaluated
+   at all, because `a and b == c` can stop before it. The pass records, per test, which swaps would have
    produced a different result. It runs under several hash seeds, and the runs are merged by
    site. The program still sees only the original results, and all 1,620 tests
    still pass under the rewrite.
@@ -77,7 +78,8 @@ edited block:
 When an edited value is computed at import time by code that could fail on the new value, the
 patched modules and their importers are imported again over the pinned sources, in a forked
 child of the selector, and a failure is confirmed in a fresh interpreter. If they no longer
-import, all tests run.
+import, all tests run. One test imports sqlglot in a subprocess, out of the profile's sight; it
+rides along whenever such an edit touches a module that `import sqlglot` itself loads.
 
 The chosen tests are then packed: longest-processing-time first for every worker count from 1
 to 8, followed by a little local search, minimising the busiest worker plus 2 s per worker.

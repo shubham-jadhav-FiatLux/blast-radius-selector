@@ -81,6 +81,10 @@ class _Indexer:
         self.runtime_names: dict[str, set[int]] = {}
         self.hook_owner = ""
         self.pure_lines: set[int] = set()
+        # line -> column ranges of annotations that are never evaluated
+        self.annotations: dict[int, list[tuple[int, int]]] = {}
+        self.postponed = False
+        self.decorated_class = False
         # modules imported while this module is being imported (module and class level)
         self.imports: set[tuple[int, str, tuple[str, ...]]] = set()
 
@@ -120,9 +124,30 @@ class _Indexer:
                 continue
             self.visit_stmt(stmt, "module" if scope == "module-body" else scope, qual, depth)
 
+    def note_annotation(self, node):
+        for ln in range(node.lineno, node.end_lineno + 1):
+            c0 = node.col_offset if ln == node.lineno else 0
+            c1 = node.end_col_offset if ln == node.end_lineno else 1 << 30
+            self.annotations.setdefault(ln, []).append((c0, c1))
+
     def visit_stmt(self, stmt, scope, qual, depth):
         here = RUNTIME if scope == "func" else IMPORT
         span = header_span(stmt)
+        # Annotations that nothing evaluates: local variable annotations always; with
+        # "from __future__ import annotations", those of undecorated functions and of plain
+        # (undecorated, so not dataclass) class bodies too.
+        if isinstance(stmt, ast.AnnAssign):
+            if scope == "func" or (self.postponed and not (scope == "class" and self.decorated_class)):
+                self.note_annotation(stmt.annotation)
+        elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and self.postponed and all(
+            _plain_decorator(d) for d in stmt.decorator_list
+        ):
+            args = stmt.args
+            for arg in args.posonlyargs + args.args + args.kwonlyargs + [args.vararg, args.kwarg]:
+                if arg is not None and arg.annotation is not None:
+                    self.note_annotation(arg.annotation)
+            if stmt.returns is not None:
+                self.note_annotation(stmt.returns)
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             for dec in stmt.decorator_list:
                 self.mark_node(dec, here, depth + 1)
@@ -134,7 +159,9 @@ class _Indexer:
                 self.note_hook(stmt)
             if isinstance(stmt, ast.ClassDef):
                 inner = "func" if scope == "func" else "class"
+                outer, self.decorated_class = self.decorated_class, bool(stmt.decorator_list)
                 self.visit_body(stmt.body, inner, qual + [stmt.name], depth + 1)
+                self.decorated_class = outer
                 if scope == "class" or scope == "module":
                     self.note_arg_types(stmt, qual + [stmt.name])
             else:
@@ -334,6 +361,16 @@ class _Indexer:
 
 
 _HOOKS = {"__init_subclass__", "__new__", "__init__", "__set_name__"}
+# Decorators that never look at a function's annotations.
+_PLAIN_DECORATORS = {"classmethod", "staticmethod", "property", "abstractmethod", "cached_property", "override"}
+
+
+def _plain_decorator(node):
+    if isinstance(node, ast.Name):
+        return node.id in _PLAIN_DECORATORS
+    if isinstance(node, ast.Attribute):
+        return node.attr in _PLAIN_DECORATORS or node.attr in ("setter", "getter", "deleter")
+    return False
 
 
 def _target_names(stmt):
@@ -470,6 +507,10 @@ def index_source(source: str) -> dict:
     """Everything the selector needs to know about one file, as plain data."""
     ix = _Indexer(source)
     tree = ast.parse(source)
+    ix.postponed = any(
+        isinstance(stmt, ast.ImportFrom) and stmt.module == "__future__" and any(a.name == "annotations" for a in stmt.names)
+        for stmt in tree.body
+    )
     ix.visit_body(tree.body, "module-body", [], 0)
     n = len(ix.lines)
     spans = []
@@ -494,4 +535,5 @@ def index_source(source: str) -> dict:
         "imports": sorted(ix.imports),
         "pure": sorted(ix.pure_lines),
         "units": compile_units(tree),
+        "annotations": ix.annotations,
     }

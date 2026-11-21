@@ -157,6 +157,19 @@ class SetTable:
         return sid
 
 
+def core_modules(src):
+    """Modules a fresh interpreter loads for a plain ``import sqlglot``."""
+    import subprocess
+
+    code = "import sys, sqlglot; print(','.join(sorted(m for m in sys.modules if m.split('.')[0] == 'sqlglot')))"
+    env = dict(os.environ, PYTHONPATH=src)
+    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, cwd="/", timeout=300)
+    names = [m for m in done.stdout.strip().split(",") if m]
+    if done.returncode != 0 or not names:
+        raise SystemExit("build_map: could not list the modules 'import sqlglot' loads: %s" % done.stderr[-500:])
+    return names
+
+
 # ----------------------------------------------------------------------------- tests/ imports
 _IMPORT_RE = re.compile(r"^\s*(?:from\s+([.\w]+)\s+import|import\s+([.\w, ]+))", re.M)
 
@@ -532,6 +545,8 @@ def main():
             "dflt": dflt,
             "checks": set(checks),
             "units": [x for unit in ix["units"] for x in unit],
+            "annot": ix["annotations"],
+            "pure": set(ix["pure"]),
             "users": GLOBAL if users == GLOBAL else table.add(users),
             "sha1": digests[rel],
         }
@@ -636,8 +651,10 @@ def main():
         "files": out_files,
         "reads": {p: (GLOBAL if b == GLOBAL else table.add(b)) for p, b in openers.items()},
         "scopes": {p: table.add(b) for p, b in scopes.items()},
-        # tests that import sqlglot in a fresh interpreter, which the profile cannot see into
+        # tests that import sqlglot in a fresh interpreter, which the profile cannot see into,
+        # and the modules such an "import sqlglot" loads
         "fresh": [tests.index[t] for t in FRESH_INTERPRETER_TESTS if t in tests.index],
+        "core": core_modules(src),
         "sets": table.sets,
     }
     data = zlib.compress(marshal.dumps(blob), 9)

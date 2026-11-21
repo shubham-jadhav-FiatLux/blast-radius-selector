@@ -22,18 +22,25 @@ import ast
 import operator
 
 OPS = {
-    ast.Lt: "<", ast.LtE: "<=", ast.Gt: ">", ast.GtE: ">=",
-    ast.Eq: "==", ast.NotEq: "!=", ast.Is: "is", ast.IsNot: "is not",
+    ast.Lt: "<", ast.LtE: "<=", ast.Gt: ">", ast.GtE: ">=", ast.Eq: "==", ast.NotEq: "!=",
+    ast.Is: "is", ast.IsNot: "is not", ast.In: "in", ast.NotIn: "not in",
 }
 FUNCS = {
     "<": operator.lt, "<=": operator.le, ">": operator.gt, ">=": operator.ge,
     "==": operator.eq, "!=": operator.ne, "is": operator.is_, "is not": operator.is_not,
+    "in": lambda a, b: a in b, "not in": lambda a, b: a not in b,
 }
-# The swaps worth observing: each changes the result only for some operand values.
+# The swaps worth observing. Most change the result only for some operand values; the
+# complements (== and !=, in and not in, < and >=, ...) change it every time the comparison is
+# evaluated, so for them it is enough to note that it ran (a statement can stop before it).
 SWAPS = {
-    "<": ["<="], "<=": ["<"], ">": [">="], ">=": [">"],
-    "is": ["=="], "is not": ["!="], "==": ["is"], "!=": ["is not"],
+    "<": ["<=", ">="], "<=": ["<", ">"], ">": [">=", "<="], ">=": [">", "<"],
+    "is": ["==", "is not"], "is not": ["!=", "is"], "==": ["is", "!="], "!=": ["is not", "=="],
+    "in": ["not in"], "not in": ["in"],
 }
+COMPLEMENT = {("<", ">="), ("<=", ">"), (">", "<="), (">=", "<"), ("is", "is not"), ("is not", "is"),
+              ("==", "!="), ("!=", "=="), ("in", "not in"), ("not in", "in")}
+ALWAYS = object()  # evaluator marker: the swap always changes the result
 
 SITES = []  # site -> (rel, line, col0, col1, text, [variant texts])
 _DETAIL = []  # site -> (boolean context, op function, [variant evaluators])
@@ -96,11 +103,13 @@ class _Rewriter(ast.NodeTransformer):
             return None
         line = self.lines[left.end_lineno - 1]
         between = line[left.end_col_offset : right.col_offset]
-        if text in ("is", "is not"):
-            stripped = between.strip()
-            if stripped != text:
+        if text in ("is", "is not", "in", "not in"):
+            if " ".join(between.split()) != text:
                 return None
-            start = left.end_col_offset + between.index(text)
+            start = left.end_col_offset + between.index(text.split()[0])
+            if text in ("is not", "not in"):
+                end = start + len(between.strip())
+                return left.end_lineno, start, end
         else:
             if between.strip() != text:
                 return None
@@ -120,7 +129,7 @@ class _Rewriter(ast.NodeTransformer):
         if where is not None:
             for swap in SWAPS.get(text, ()):
                 variants.append(swap)
-                evaluators.append(_binary(FUNCS[swap]))
+                evaluators.append(ALWAYS if (text, swap) in COMPLEMENT and id(node) in self.bool_nodes else _binary(FUNCS[swap]))
         # integer constants on either side: the neighbouring values
         consts = []
         for side, operand in (("l", left), ("r", right)):
@@ -132,7 +141,7 @@ class _Rewriter(ast.NodeTransformer):
         site_variants = []
         if where is not None:
             ln, c0, c1 = where
-            SITES.append((self.rel, ln, c0, c1, " %s " % text if text in ("is", "is not") else text, list(variants)))
+            SITES.append((self.rel, ln, c0, c1, self.lines[ln - 1][c0:c1], list(variants)))
             site_variants = list(evaluators)
         else:
             SITES.append((self.rel, node.lineno, -1, -1, text, []))
@@ -231,6 +240,9 @@ def install(current):
             for index, evaluate in enumerate(evals):
                 code = (site + offset) * 4 + index
                 if code in seen:
+                    continue
+                if evaluate is ALWAYS:
+                    seen.add(code)
                     continue
                 try:
                     other = evaluate(a, b)

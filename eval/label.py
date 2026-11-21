@@ -49,8 +49,11 @@ def run_suite(tree, out_dir, image, jobs, targets=("tests",)):
     if os.path.exists(out):
         os.remove(out)
     parallel = ["-n", str(jobs)] if jobs > 1 else ["-p", "no:xdist"]
+    # Pinning the container to as many CPUs as it may use keeps process pools (sized by
+    # os.process_cpu_count()) from oversubscribing the machine.
+    cpus = max(jobs, 2)
     cmd = [
-        "docker", "run", "--rm", "--cpus", str(max(jobs, 2)), "--memory", "5g", "--memory-swap", "5g",
+        "docker", "run", "--rm", "--cpuset-cpus", "0-%d" % (cpus - 1), "--memory", "5g", "--memory-swap", "5g",
         "-v", "%s:/src:ro" % tree, "-v", "%s:/plugins:ro" % PLUGINS, "-v", "%s:/out" % out_dir,
         "-e", "PYTHONPATH=/src:/plugins", "-e", "OUTCOME_OUT=/out/outcomes.json", "-w", "/src", image,
         "python", "-m", "pytest", "-q", "-p", "outcome_plugin", "-p", "no:cacheprovider",

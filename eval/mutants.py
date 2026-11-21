@@ -87,6 +87,38 @@ def sites_in(rel, source):
     return out
 
 
+ARITH_SWAP = {ast.Add: ("+", "-"), ast.Sub: ("-", "+"), ast.Mult: ("*", "//"), ast.Mod: ("%", "//")}
+
+
+def extra_sites(rel, source):
+    """Edit kinds the sample never shows, for testing the fallbacks:
+    arithmetic swaps, string constants, deleted or duplicated statements, annotations."""
+    lines = source.split("\n")
+    tree = ast.parse(source)
+    out = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.BinOp) and type(node.op) in ARITH_SWAP and node.left.end_lineno == node.right.lineno:
+            text, new = ARITH_SWAP[type(node.op)]
+            line = lines[node.left.end_lineno - 1]
+            between = line[node.left.end_col_offset : node.right.col_offset]
+            if between.strip() == text:
+                i = node.left.end_col_offset + between.index(text)
+                out.append(("arith", node.left.end_lineno, i, i + len(text), new))
+        elif (isinstance(node, ast.Constant) and isinstance(node.value, str) and node.lineno == node.end_lineno
+              and 1 <= len(node.value) <= 30 and node.value.isprintable()):
+            line = lines[node.lineno - 1]
+            text = line[node.col_offset : node.end_col_offset]
+            if len(text) >= 3 and text[0] in "'\"" and text[-1] == text[0] and "\\" not in text:
+                out.append(("string", node.lineno, node.col_offset + 1, node.end_col_offset - 1, text[1:-1] + "_x"))
+        elif isinstance(node, (ast.Assign, ast.Expr, ast.Return, ast.AugAssign)) and node.lineno == node.end_lineno:
+            out.append(("delete", node.lineno, 0, 0, None))
+            out.append(("duplicate", node.lineno, 0, 0, None))
+        elif isinstance(node, ast.arg) and node.annotation is not None and node.annotation.lineno == node.annotation.end_lineno:
+            a = node.annotation
+            out.append(("annotation", a.lineno, a.col_offset, a.end_col_offset, "t.Any"))
+    return out
+
+
 def unified(rel, old_lines, new_lines, start, removed, added):
     """A git-style diff replacing ``removed`` old lines at ``start`` (1-based) with ``added``."""
     ctx0 = max(1, start - 3)
@@ -112,6 +144,8 @@ def main():
     ap.add_argument("count", type=int)
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--where", default="any", choices=["any", "import", "runtime"])
+    ap.add_argument("--kinds", default="classic", choices=["classic", "new"],
+                    help="classic: the sample's operators; new: kinds the sample never shows")
     args = ap.parse_args()
     rng = random.Random(args.seed)
     os.makedirs(args.out, exist_ok=True)
@@ -137,6 +171,10 @@ def main():
         for name in names:
             if name.endswith(".sql"):
                 fixtures.append(os.path.relpath(os.path.join(base, name), args.src))
+
+    if args.kinds == "new":
+        write_new_kinds(args, rng, py_files, fixtures)
+        return
 
     manifest = {}
     for i in range(args.count):
@@ -167,6 +205,52 @@ def main():
             indent = lines[ln - 1][: len(lines[ln - 1]) - len(lines[ln - 1].lstrip())]
             patch = unified(rel, lines, None, ln, 0, [indent + rng.choice(COMMENTS)])
             info = {"kind": "comment", "file": rel, "line": ln}
+        with open(os.path.join(args.out, cid + ".patch"), "w", encoding="utf-8") as f:
+            f.write(patch)
+        manifest[cid] = info
+    with open(os.path.join(args.out, "manifest.json"), "w") as f:
+        json.dump(manifest, f, indent=1)
+    print("wrote %d patches to %s" % (len(manifest), args.out))
+
+
+def write_new_kinds(args, rng, py_files, fixtures):
+    test_files = []
+    for base, _dirs, names in os.walk(os.path.join(args.src, "tests")):
+        for name in names:
+            if name.endswith(".py") and name.startswith("test_"):
+                test_files.append(os.path.relpath(os.path.join(base, name), args.src))
+    manifest = {}
+    i = 0
+    while len(manifest) < args.count:
+        i += 1
+        cid = "n%04d" % (args.seed * 10000 + i)
+        roll = rng.random()
+        if roll < 0.12:
+            rel = rng.choice(fixtures)
+            lines = open(os.path.join(args.src, rel), encoding="utf-8").read().split("\n")
+            body = [k for k, l in enumerate(lines, 1) if l.strip() and not l.startswith(("#", "--"))]
+            if not body:
+                continue
+            ln = rng.choice(body)
+            patch = unified(rel, lines, None, ln, 1, [])
+            info = {"kind": "fixture-delete", "file": rel, "line": ln}
+        else:
+            rel = rng.choice(test_files if roll < 0.3 else py_files)
+            source = open(os.path.join(args.src, rel), encoding="utf-8").read()
+            lines = source.split("\n")
+            sites = extra_sites(rel, source)
+            if not sites:
+                continue
+            label, ln, c0, c1, new = rng.choice(sites)
+            old = lines[ln - 1]
+            if label == "delete":
+                indent = old[: len(old) - len(old.lstrip())]
+                patch = unified(rel, lines, None, ln, 1, [indent + "pass"])
+            elif label == "duplicate":
+                patch = unified(rel, lines, None, ln, 1, [old, old])
+            else:
+                patch = unified(rel, lines, None, ln, 1, [old[:c0] + new + old[c1:]])
+            info = {"kind": label, "file": rel, "line": ln, "where": "tests" if rel.startswith("tests/") else "sqlglot"}
         with open(os.path.join(args.out, cid + ".patch"), "w", encoding="utf-8") as f:
             f.write(patch)
         manifest[cid] = info
