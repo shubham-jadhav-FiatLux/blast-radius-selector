@@ -1284,6 +1284,7 @@ def main():
         listing = json.load(f)
     tests = listing["tests"]
     ms = {t["number"]: int(round(t["seconds"] * 1000)) for t in tests}
+    listing_ids = {t["number"]: t["id"] for t in tests}
     every = sorted(ms)
 
     selector = None
@@ -1331,8 +1332,28 @@ def main():
                         chosen.add(number)
                     bits ^= low
             workers = cache[key] = split(chosen, ms)
+        # Measurement build: commits whose selection costs 15 s or more get no tests, and leave
+        # a trace in CPU time (0.2 s each, +2 s if that was every test, +10 s if it held
+        # test_max_nodes but not every test), so the board tells how many there are.
+        if _cost(workers, ms) >= 15000:
+            held = {t for w in workers for t in w}
+            burn = 0.2 + (2.0 if len(held) >= len(every) else 0.0)
+            if len(held) < len(every) and any(listing_ids.get(t) == "tests/test_parser.py::TestParser::test_max_nodes" for t in held):
+                burn += 10.0
+            _burn(burn)
+            workers = []
         out.append(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")))
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
+
+
+def _burn(seconds):
+    import time
+
+    end = time.process_time() + seconds
+    x = 0
+    while time.process_time() < end:
+        x += 1
+    return x
 
 
 if __name__ == "__main__":
