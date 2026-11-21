@@ -30,12 +30,27 @@ from source_index import DOC, IMPORT, MIXED, NONE, RUNTIME, index_source  # noqa
 NO_TESTS = -1
 GLOBAL = -2
 FRESH_INTERPRETER_TESTS = ("tests/dialects/test_dialect.py::TestDialect::test_lazy_load",)
+# Split into one profile context per query; the selector can re-check single queries of it.
+PER_QUERY_TEST = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+OUTSIDE = -1  # touched outside any single query
 FORMAT = 1
 PINNED = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
 SOURCE_DIRS = ("sqlglot/", "tests/", "sqlglotc/")
 
 
 # ----------------------------------------------------------------------------- profile
+def _split_runs(paths):
+    """Profiles that split the per-query test into one context per query."""
+    out = set()
+    for path in paths:
+        with gzip.open(path, "rt") as f:
+            for raw in f:
+                if raw[0] in "CW" and (PER_QUERY_TEST + "|call#q") in raw.split("\t", 1)[0]:
+                    out.add(path)
+                    break
+    return out
+
+
 def read_profile(paths, meta=None):
     """ctx -> {"lines": {(rel, signed line)}, "reads": {path}, "missing": {(class, arg)},
     "attrs": {"owner:attr"}}. Class metadata (A and K records) goes into ``meta``."""
@@ -55,7 +70,10 @@ def read_profile(paths, meta=None):
                     files[int(fid)] = rel
                 else:
                     records.append((kind, rest))
+        unsplit = path not in meta.get("split_runs", {path})
         for kind, rest in records:
+            if unsplit and rest.startswith(PER_QUERY_TEST + "|call\t"):
+                rest = PER_QUERY_TEST + "|call#unsplit" + rest[len(PER_QUERY_TEST + "|call"):]
             if kind == "S":
                 meta["sites"] = json.loads(rest.lstrip("\t"))
                 continue
@@ -157,6 +175,21 @@ class SetTable:
             sid = self.ids[bits] = len(self.sets)
             self.sets.append(bits)
         return sid
+
+
+def per_query_reference(path, index):
+    """Reference digests and timings for the per-query test, or None."""
+    if not path or index is None:
+        return None
+    with open(path) as f:
+        ref = json.load(f)
+    return {
+        "test": index,
+        "load": ref["load_seconds"],
+        "rows": [q["rows"] for q in ref["queries"]],
+        "duckdb": [q["duckdb"] for q in ref["queries"]],
+        "seconds": [q["seconds"] for q in ref["queries"]],
+    }
 
 
 def core_modules(src):
@@ -316,6 +349,7 @@ def main():
     ap.add_argument("--weak", nargs="*", default=[], help="profiles recorded with PROFILE_WEAK=1")
     ap.add_argument("--weak-outcomes", nargs="*", default=[], help="outcomes of the weak runs")
     ap.add_argument("--keys", nargs="*", default=[], help="profiles recorded with PROFILE_KEYS=1 (also in --profile)")
+    ap.add_argument("--tpcds", default=None, help="reference fingerprints from src/tpcds_check.py")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     src = os.path.abspath(args.src)
@@ -324,7 +358,7 @@ def main():
     if failed:
         print("build_map: %d tests failed during profiling: %s" % (len(failed), failed[:5]), file=sys.stderr)
     tests = Tests(order)
-    meta = {}
+    meta = {"split_runs": _split_runs(args.profile)}
     contexts = read_profile(args.profile, meta)
     table = SetTable()
 
@@ -334,14 +368,25 @@ def main():
     global_func = set()
     module_users = defaultdict(int)
     module_global = set()
+    pq_index = tests.index.get(PER_QUERY_TEST)
+    pq_bit = 1 << pq_index if pq_index is not None else 0
+    pq_prefix = PER_QUERY_TEST + "|call#q"
+    qcov = defaultdict(set)  # (rel, line) -> queries of the per-query test that ran it (or OUTSIDE)
     for ctx, entry in contexts.items():
         charged = tests.resolve(ctx)
+        query = int(ctx[len(pq_prefix):]) if ctx.startswith(pq_prefix) else None
+        unsplit = ctx.endswith("|call#unsplit")
         for rel, line in entry["lines"]:
             if line > 0:
                 if charged == GLOBAL:
                     global_func.add((rel, line))
                 else:
                     cov[(rel, line)] |= charged
+                    if charged & pq_bit:
+                        if unsplit:  # a run that did not split the test only says "somewhere in it"
+                            qcov[(rel, line)].add("unsplit")
+                        else:
+                            qcov[(rel, line)].add(OUTSIDE if query is None else query)
             elif charged == GLOBAL:
                 module_global.add(rel)
             else:
@@ -478,7 +523,8 @@ def main():
     # no key record used it in a way the profile cannot see and is charged for every key.
     key_bits = defaultdict(int)
     key_tags = set()
-    for ctx, entry in contexts.items():
+    key_contexts = read_profile(args.keys, {"split_runs": _split_runs(args.keys)}) if args.keys else {}
+    for ctx, entry in key_contexts.items():
         found = entry.get("keys")
         if not found:
             continue
@@ -493,7 +539,7 @@ def main():
     # inside the dict (every way in is recorded). Readers only seen in other runs are charged.
     keyrun_reads = defaultdict(int)
     if args.keys:
-        for ctx, entry in read_profile(args.keys, {}).items():
+        for ctx, entry in key_contexts.items():
             charged = tests.resolve(ctx)
             for tag in entry["attrs"]:
                 if charged == GLOBAL or keyrun_reads[tag] == GLOBAL:
@@ -523,6 +569,7 @@ def main():
         kind = ix["kind"]
         spans = ix["spans"]
         sets = {}
+        qsets = {}
         checks = []
         for ln in range(1, ix["n"] + 1):
             k = kind[ln - 1]
@@ -532,6 +579,17 @@ def main():
             sid = table.add(union_eff(rel, range(a, b + 1)))
             if sid != NO_TESTS:
                 sets[ln] = sid
+                if sid >= 0 and table.sets[sid] & pq_bit:
+                    queries = set()
+                    for l2 in range(a, b + 1):
+                        seen = qcov.get((rel, l2), set())
+                        if "unsplit" in seen and not any(isinstance(q, int) and q >= 0 for q in seen):
+                            queries.add(OUTSIDE)  # only the unsplit runs saw the test here
+                        queries |= {q for q in seen if q != "unsplit"}
+                        if (rel, l2) in via_import:
+                            queries.add(OUTSIDE)
+                    if queries and OUTSIDE not in queries:
+                        qsets[ln] = tuple(sorted(queries))
             if any((rel, l2) in via_import for l2 in range(a, b + 1)):
                 checks.append(ln)  # the edited code also ran at import time; it could now fail there
 
@@ -604,6 +662,7 @@ def main():
             "kattr": kattr,
             "dflt": dflt,
             "checks": set(checks),
+            "qsets": qsets,
             "units": [x for unit in ix["units"] for x in unit],
             "annot": ix["annotations"],
             "pure": set(ix["pure"]),
@@ -636,9 +695,11 @@ def main():
         if unprofiled:
             print("build_map: %d tests have no weak profile; they keep plain coverage" % bin(unprofiled).count("1"), file=sys.stderr)
         infected = defaultdict(int)  # (rel, ln, c0, c1, text, variant) -> bits or GLOBAL
+        qinfected = defaultdict(set)  # same key -> queries of the per-query test (or OUTSIDE)
         known = set()
+        weak_split = _split_runs(args.weak)
         for path in args.weak:
-            wmeta = {}
+            wmeta = {"split_runs": weak_split}
             wcontexts = read_profile([path], wmeta)
             sites = wmeta.get("sites", [])
             for rel, ln, c0, c1, text, variants in sites:
@@ -649,6 +710,9 @@ def main():
                 if not codes:
                     continue
                 charged = tests.resolve(ctx)
+                query = int(ctx[len(pq_prefix):]) if ctx.startswith(pq_prefix) else None
+                if ctx.endswith("|call#unsplit"):
+                    query = "unsplit"
                 for code in codes:
                     site, index = divmod(code, 4)
                     rel, ln, c0, c1, text, variants = sites[site]
@@ -657,6 +721,8 @@ def main():
                         infected[key] = GLOBAL
                     else:
                         infected[key] |= charged
+                        if charged & pq_bit:
+                            qinfected[key].add(OUTSIDE if query is None else query)
         by_site = defaultdict(list)
         for key in sorted(known):
             rel, ln, c0, c1, text, vtext = key
@@ -666,7 +732,12 @@ def main():
             if bits == GLOBAL:
                 continue  # it would differ while sqlglot is being imported: no shortcut
             fallback = cov.get((rel, ln), 0) & unprofiled
-            by_site[(rel, ln, c0, c1, text)].append((vtext, table.add(bits | fallback)))
+            sid = table.add(bits | fallback)
+            queries = qinfected.get(key, set())
+            if "unsplit" in queries:
+                queries = {OUTSIDE} if not any(isinstance(x, int) and x >= 0 for x in queries) else queries - {"unsplit"}
+            q = tuple(sorted(queries)) if queries and OUTSIDE not in queries and not fallback & pq_bit else None
+            by_site[(rel, ln, c0, c1, text)].append((vtext, sid, q))
         for (rel, ln, c0, c1, text), usable in by_site.items():
             shown = text if len(text) == c1 - c0 else text.strip()  # the exact source text at c0..c1
             out_files[rel].setdefault("weak", {}).setdefault(ln, []).append((c0, c1, shown, usable))
@@ -715,6 +786,7 @@ def main():
         # and the modules such an "import sqlglot" loads
         "fresh": [tests.index[t] for t in FRESH_INTERPRETER_TESTS if t in tests.index],
         "core": core_modules(src),
+        "per_query": per_query_reference(args.tpcds, pq_index),
         "sets": table.sets,
     }
     data = zlib.compress(marshal.dumps(blob), 9)

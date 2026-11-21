@@ -41,6 +41,11 @@ labelled its commits in (`profiling/`):
    still pass under the rewrite.
 
    A few details make the attribution trustworthy:
+   - caches shared between tests are cleared before each one. sqlglot caches every generator
+     class's dispatch table (its `TRANSFORMS` plus the `*_sql` methods), and the executor
+     tests cache duckdb's answers per query. Otherwise only the first test to use a dialect
+     would run that code or read its `TRANSFORMS`. The dispatch table is also recorded by key,
+     so a test is charged for the expression types it actually generated;
    - every sqlglot module is imported before collection, so lazily loaded dialects do not
      charge their import-time work to whichever test happened to touch them first;
    - while importing, each function line is tied to the module or class statement it ran for.
@@ -79,6 +84,14 @@ edited block:
 | module level code in `tests/` | tests in that module and in every module importing it |
 | data file (SQL fixtures) | the tests that opened it |
 | anything that no longer compiles, config files, deletions and renames | all tests |
+
+`test_execute_tpcds` (21.5 s, most of the cost whenever it is selected) runs about a hundred
+TPC-DS queries through sqlglot's executor and compares each with duckdb's answer for sqlglot's
+own transpiled SQL. The profile splits it into one context per query. When an edit reaches only
+a few queries, the selector replays those queries over the patched sources (`src/tpcds_check.py`)
+and leaves the test out if every one gives the same result table and the same duckdb SQL as at
+the pinned commit (digests in `data/tpcds_reference.json`). This is only tried when it is far
+cheaper than the test, and never when the patch touches `tests/`.
 
 When an edited value is computed at import time by code that could fail on the new value, the
 patched modules and their importers are imported again over the pinned sources, in a forked

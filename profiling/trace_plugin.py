@@ -289,7 +289,12 @@ KEYS = os.environ.get("PROFILE_KEYS") == "1"
 _key_reads = {}
 
 
+_suppressed = [False]
+
+
 def _note_key(tag, key):
+    if _suppressed[0]:
+        return
     seen = _key_reads.get(_ctx)
     if seen is None:
         seen = _key_reads[_ctx] = set()
@@ -494,6 +499,49 @@ def _install_read_recorders():
         _out.write("K %s\t%s\t%s\n" % (_key_of(cls), mro, "|".join(parts)))
 
 
+def _reset_runtime_caches():
+    """Caches shared across tests would charge their work to whichever test filled them first.
+    sqlglot.generator caches each generator class's dispatch table (TRANSFORMS plus the *_sql
+    methods) the first time one is built; clearing such caches before every test makes each
+    test do (and be charged for) its own."""
+    gen = sys.modules.get("sqlglot.generator")
+    cache = getattr(gen, "_DISPATCH_CACHE", None)
+    if isinstance(cache, dict):
+        cache.clear()
+    # TestExecutor keeps duckdb's answers per SQL text in a class-level dict shared by the TPC-H
+    # tests; without clearing it only the first of them would run transpile() for each query.
+    executor_tests = sys.modules.get("tests.test_executor")
+    shared = getattr(getattr(executor_tests, "TestExecutor", None), "cache", None)
+    if isinstance(shared, dict):
+        shared.clear()
+
+
+def _record_dispatch_keys():
+    """Serve each dispatch table as a key-recording copy tagged like the TRANSFORMS it came from,
+    so a test is charged for the expression types it generated, not for the bulk copy of
+    TRANSFORMS made while building the table."""
+    gen = sys.modules.get("sqlglot.generator")
+    if gen is None or not hasattr(gen, "_build_dispatch"):
+        return
+    original = gen._build_dispatch
+
+    def build(cls):
+        _suppressed[0] = True
+        try:
+            dispatch = original(cls)
+        finally:
+            _suppressed[0] = False
+        for klass in cls.__mro__:
+            desc = klass.__dict__.get("TRANSFORMS")
+            if isinstance(desc, _Recorded):
+                served = _KeyRecordingDict(dispatch)
+                served._tag = desc.tag
+                return served
+        return dispatch
+
+    gen._build_dispatch = build
+
+
 def _reinstall_read_recorders():
     """Tests that patch a class attribute restore the plain value; put the recorder back."""
     for cls, name, desc in _installed:
@@ -562,6 +610,8 @@ def pytest_configure(config):
     _record_missing_args()
     if READS:
         _install_read_recorders()
+        if KEYS:
+            _record_dispatch_keys()
     _flush("<import>")
     _enter("<other>")
 
@@ -593,16 +643,82 @@ def pytest_fixture_setup(fixturedef, request):
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_setup(item):
+    _reset_runtime_caches()
     _enter(item.nodeid + "|setup")
     yield
     _flush(item.nodeid + "|setup")
 
 
+# test_execute_tpcds runs ~100 TPC-DS queries, each parsed, sent through a process pool,
+# executed and compared with duckdb's answer for sqlglot's own transpiled SQL. Its call phase is
+# split into one context per query ("<nodeid>|call#q<k>"), so the selector can re-check just
+# the queries an edit touches instead of paying for the whole test.
+PER_QUERY = {"tests/test_executor.py::TestExecutor::test_execute_tpcds"}
+
+
+class _PerQuery:
+    def __init__(self, item):
+        self.item = item
+        self.base = item.nodeid + "|call"
+        self.count = 0
+        self.patches = []
+
+    def __enter__(self):
+        import unittest
+
+        module = self.item.module
+        original_parse = module.parse_one
+        original_subtest = unittest.TestCase.subTest
+        owner = self
+
+        def parse_one(sql, *args, **kwargs):
+            # the test parses query k right before submitting it to the pool
+            _enter("%s#q%d" % (owner.base, owner.count))
+            owner.count += 1
+            return original_parse(sql, *args, **kwargs)
+
+        def sub_test(case, msg=None, **params):
+            label = str(msg or "")
+            if label.startswith("tpc-ds ") and label[7:].isdigit():
+                return owner.scoped("%s#q%d" % (owner.base, int(label[7:]) - 1), original_subtest(case, msg, **params))
+            return original_subtest(case, msg, **params)
+
+        module.parse_one = parse_one
+        unittest.TestCase.subTest = sub_test
+        self.patches = [(module, "parse_one", original_parse), (unittest.TestCase, "subTest", original_subtest)]
+        return self
+
+    def scoped(self, ctx, inner):
+        import contextlib
+
+        @contextlib.contextmanager
+        def manager():
+            _enter(ctx)
+            try:
+                with inner:
+                    yield
+            finally:
+                _enter(self.base)  # anything between subtests belongs to the whole test
+
+        return manager()
+
+    def __exit__(self, *exc):
+        for obj, name, value in self.patches:
+            setattr(obj, name, value)
+        return False
+
+
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_call(item):
     _enter(item.nodeid + "|call")
-    yield
-    _flush(item.nodeid + "|call")
+    if item.nodeid in PER_QUERY:
+        with _PerQuery(item):
+            yield
+        _enter(item.nodeid + "|call")
+    else:
+        yield
+    for ctx in [c for c in set(_lines) | set(_weak) | set(_attr_reads) | set(_reads) | set(_key_reads) if c.startswith(item.nodeid + "|call")]:
+        _flush(ctx)
 
 
 @pytest.hookimpl(hookwrapper=True)

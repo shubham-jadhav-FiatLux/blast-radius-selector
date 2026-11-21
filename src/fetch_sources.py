@@ -2,9 +2,10 @@
 
     python fetch_sources.py <commit> <target dir>
 
-Downloads sqlglot's own repository archive at the pinned commit and keeps its Python files.
-The selector uses them to check that a patched module still compiles. If the download fails
-the build still succeeds: the selector then skips that check and relies on the map alone.
+Downloads sqlglot's own repository archive at the pinned commit and keeps its Python files,
+plus the TPC-DS fixtures. The selector uses them to check that a patched module still compiles
+and imports, and to re-check single TPC-DS queries. If the download fails the build still
+succeeds: the selector then skips those checks and relies on the map alone.
 """
 
 import io
@@ -15,6 +16,8 @@ import time
 import urllib.request
 
 KEEP = ("sqlglot/", "tests/", "sqlglotc/")
+# Data the selector re-checks single TPC-DS queries with (see tpcds_check.py).
+KEEP_DATA = ("tests/fixtures/optimizer/tpc-ds/",)
 
 
 def download(commit):
@@ -43,9 +46,12 @@ def main():
             if not member.isfile():
                 continue
             _, _, rel = member.name.partition("/")
-            if not rel.endswith(".py") or ".." in rel.split("/") or rel.startswith("/"):
+            if ".." in rel.split("/") or rel.startswith("/"):
                 continue
-            if not (rel.startswith(KEEP) or "/" not in rel):
+            if rel.endswith(".py"):
+                if not (rel.startswith(KEEP) or "/" not in rel):
+                    continue
+            elif not rel.startswith(KEEP_DATA):
                 continue
             path = target.rstrip("/") + "/" + rel
             os.makedirs(os.path.dirname(path), exist_ok=True)

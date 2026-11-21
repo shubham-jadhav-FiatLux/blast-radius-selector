@@ -38,6 +38,7 @@ NONE, RUNTIME, IMPORT, MIXED, DOC = 0, 1, 2, 3, 4
 IN_STRING, STRING_AFTER, CONTINUED = 1, 2, 4
 WORKER_MS = 2000
 MAX_WORKERS = 8
+PER_QUERY_BUDGET = 12.0  # seconds of re-checking worth trying instead of a 21 s test
 
 CONFIG_FILES = {"pyproject.toml", "setup.cfg", "tox.ini", "pytest.ini", "conftest.py", ".coveragerc"}
 CODING_RE = re.compile(r"^[ \t\f]*#.*?coding[:=]")
@@ -332,6 +333,8 @@ class Selector:
         self.scopes = blob["scopes"]
         self.sets = blob["sets"]
         self.fresh = blob.get("fresh", [])
+        self.per_query = blob.get("per_query")
+        self.pq_bit = (1 << self.per_query["test"]) if self.per_query else 0
         self.core = set(blob.get("core", ())) or None
         self._warm = False
         self._baseline = None
@@ -340,7 +343,8 @@ class Selector:
 
     # Accumulates either a bitset over map test indices or the GLOBAL marker.
     def run(self, patch_text):
-        acc = [0, False]
+        # [tests, everything, queries of the per-query test, per-query test charged as a whole]
+        acc = [0, False, set(), False]
         self.import_check = set()
         self.patched = {}
         self.changed = {}
@@ -355,7 +359,46 @@ class Selector:
             if self.core is None or any(_module_of(p) in self.core for p in self.import_check):
                 for index in self.fresh:  # these import sqlglot in a fresh interpreter
                     acc[0] |= 1 << index
+        if not acc[1] and acc[0] & self.pq_bit and not acc[3] and acc[2] and self.recheck_queries(acc[2]):
+            acc[0] &= ~self.pq_bit
         return acc
+
+    def recheck_queries(self, queries):
+        """True if the per-query test still passes for every query the edit can reach: each
+        one, run over the patched sources, gives the same result table and the same duckdb SQL
+        as at the pinned commit. Only tried when that is much cheaper than running the test."""
+        ref = self.per_query
+        if any(k >= len(ref["rows"]) for k in queries):
+            return False
+        if any(path.startswith("tests/") for path in self.changed):
+            return False  # the re-check replays the test as written at the pinned commit
+        estimate = sum(ref["seconds"][k] for k in queries)
+        if any(ref["rows"][k] is not None for k in queries):
+            estimate += ref["load"]
+        if estimate > PER_QUERY_BUDGET:
+            log("per-query test: %d queries, about %.1f s to re-check; running it whole" % (len(queries), estimate))
+            return False
+        if not os.path.isdir(os.path.join(self.sources, "tests", "fixtures", "optimizer", "tpc-ds")):
+            return False
+        expected = {k: (ref["rows"][k], ref["duckdb"][k]) for k in queries}
+        script = os.path.join(HERE, "tpcds_check.py")
+
+        def same():
+            import importlib.util
+
+            spec = importlib.util.spec_from_file_location("tpcds_check", script)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            got = module.fingerprints(self.sources, list(queries))
+            differ = sorted(k for k in expected if got.get(k) != expected[k])
+            if differ:
+                log("per-query test: queries", differ, "change with this patch")
+            return not differ
+
+        ok = self.in_patched_child(same)
+        if ok:
+            log("per-query test passes for queries", sorted(queries), "- left out")
+        return ok
 
     def imports_cleanly(self):
         """An edit to an import-time value is charged to the tests that read it, which is only
@@ -394,7 +437,37 @@ class Selector:
         finally:
             shutil.rmtree(overlay, ignore_errors=True)
 
-    def forked_check(self, overlay, wanted):
+    def in_patched_child(self, check):
+        """Runs ``check()`` in a forked child with the patched modules (and their importers)
+        imported again over the pinned sources. False on any error or without fork."""
+        if not hasattr(os, "fork") or not os.path.isdir(self.sources):
+            return False
+        for path, (info, blocks) in self.changed.items():
+            if self.source_lines(path, info) is None:
+                return False
+            self.patched_text(path, info, blocks)
+        wanted = set()
+        for path in self.patched:
+            wanted.add(_module_of(path))
+            wanted.update(m for m in self.files[path].get("importers", ()) if not m.endswith("__main__"))
+        import shutil
+        import tempfile
+
+        overlay = tempfile.mkdtemp(prefix="blast-")
+        try:
+            for path, text in self.patched.items():
+                dest = os.path.join(overlay, path)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with open(dest, "w", encoding="utf-8") as f:
+                    f.write(text)
+            return self.forked_check(overlay, wanted, check)
+        except Exception as error:  # noqa: BLE001
+            log("patched child failed to run:", repr(error))
+            return False
+        finally:
+            shutil.rmtree(overlay, ignore_errors=True)
+
+    def forked_check(self, overlay, wanted, check=None):
         """Imports sqlglot once in this process, then re-imports the patched modules (and the
         modules that import them) in a forked child, which costs far less than a fresh start."""
         if not self._warm:
@@ -418,15 +491,19 @@ class Selector:
                 import importlib
 
                 scope = {_module_of(p) for p in self.patched} | wanted
+                # a package imported again must not keep stale submodules around (they would be
+                # missing as attributes of the new package object), so those go too
                 for name in list(sys.modules):
-                    if name in scope:
+                    if name in scope or any(name.startswith(pkg + ".") for pkg in scope):
                         del sys.modules[name]
                 sys.meta_path.insert(0, _overlay_finder(overlay, self.sources))
                 for name in ["sqlglot"] + sorted(wanted):
                     if name not in self.baseline():
                         importlib.import_module(name)
-                status = 0
-            except BaseException:  # noqa: BLE001
+                status = 0 if check is None or check() else 1
+            except BaseException as error:  # noqa: BLE001
+                if check is not None:
+                    log("patched child:", repr(error)[:300])
                 status = 1
             finally:
                 os._exit(status)
@@ -457,11 +534,19 @@ class Selector:
                 self._baseline = []
         return self._baseline
 
-    def charge(self, acc, sid):
+    def charge(self, acc, sid, queries=None):
+        """Adds a test set. ``queries`` says which queries of the per-query test the edit can
+        reach through this set; without it, that test is charged as a whole."""
         if sid == GLOBAL:
             acc[1] = True
         elif sid >= 0:
-            acc[0] |= self.sets[sid]
+            bits = self.sets[sid]
+            acc[0] |= bits
+            if self.pq_bit and bits & self.pq_bit:
+                if queries is None:
+                    acc[3] = True
+                else:
+                    acc[2].update(queries)
 
     def file_change(self, ch, acc):
         path = ch.path or ch.old_path
@@ -609,11 +694,12 @@ class Selector:
         for c0, c1, text, variants in sites:
             if old[c0:c1] != text:
                 continue
-            for vtext, sid in variants:
+            for vtext, sid, *queries in variants:
+                q = queries[0] if queries else None
                 if old[:c0] + vtext + old[c1:] == new:
-                    return sid
+                    return sid, q
                 if vtext in ("==", "!=") and old[:c0].rstrip() + " " + vtext + " " + old[c1:].lstrip() == new:
-                    return sid
+                    return sid, q
         return None
 
     def compiles(self, path, info, blocks):
@@ -690,12 +776,13 @@ class Selector:
                     if any(c0 <= a0 and max(a1, a0 + 1) <= c1 for c0, c1 in info["annot"][ln]):
                         continue  # an annotation nothing evaluates
                 if k in (RUNTIME, MIXED) and pairs and len(b.old) == 1 and ln in info["weak"]:
-                    sid = self.weak_match(info["weak"][ln], b.old[0], b.new[0])
-                    if sid is not None:
-                        self.charge(acc, sid)
+                    hit = self.weak_match(info["weak"][ln], b.old[0], b.new[0])
+                    if hit is not None:
+                        self.charge(acc, hit[0], hit[1])
                         continue
+                qsets = info.get("qsets", {})
                 if k == RUNTIME:
-                    self.charge(acc, sets.get(ln, NO_TESTS))
+                    self.charge(acc, sets.get(ln, NO_TESTS), qsets.get(ln))
                     if ln in info["checks"]:
                         self.import_check.add(path)
                     continue
@@ -705,7 +792,7 @@ class Selector:
                 if k == MIXED and cols is not None:
                     a, z = cols[0], max(cols[1], cols[0] + 1)
                     if any(c0 <= a and z <= c1 for c0, c1 in info["cols"].get(ln, ())):
-                        self.charge(acc, sets.get(ln, NO_TESTS))
+                        self.charge(acc, sets.get(ln, NO_TESTS), qsets.get(ln))
                         if ln in info["checks"]:
                             self.import_check.add(path)
                         continue
@@ -868,7 +955,7 @@ def main():
                 text = f.read()
             if selector is None:
                 raise RuntimeError("no map")
-            bits, everything = selector.run(text)
+            bits, everything = selector.run(text)[:2]
         except Exception as error:  # noqa: BLE001
             log(cid, "selection failed, running everything:", repr(error))
             bits, everything = 0, True

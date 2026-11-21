@@ -1,0 +1,501 @@
+{
+"queries": [
+{
+"rows": "7fec2a1580c9e3acdb0cf5908cf6bc428cf5523c",
+"duckdb": "0dffb977e7e43e9941b0e7622ab2e5c820fb38e9",
+"seconds": 0.506
+},
+{
+"rows": "74f273a6902c47aac178a8307920d80d0a478e5c",
+"duckdb": "52f824473361f23feb03b2b98bc60e917962818b",
+"seconds": 0.584
+},
+{
+"rows": "10f01f0c366ac6afe3f7b534f771faff1e8531ce",
+"duckdb": "f33c58822c836b733aecb83aaf99bacfbefecd12",
+"seconds": 0.319
+},
+{
+"rows": "c6431758c53c32b8142b7a792714b1f0f63d1691",
+"duckdb": "92cbfda9e5116123e8e94d53c26ed858300bf17b",
+"seconds": 0.961
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.015
+},
+{
+"rows": "2a48735b97966e3c49d1f51e1e035c3cf54dcb24",
+"duckdb": "4756dfa56a535b852bbf762d824429874f4a0536",
+"seconds": 0.504
+},
+{
+"rows": "c644b7565883bc16566bcd69a06616677d2d14fb",
+"duckdb": "e1267902412c6ede88dc853d6aed63a3c79f18cf",
+"seconds": 0.449
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.014
+},
+{
+"rows": "2cb305b2a3685b7dcf4ac9b13402dcd6d4484740",
+"duckdb": "b11b8d091ad17482812f73bb13016a3512ecf492",
+"seconds": 0.813
+},
+{
+"rows": "d7a37d3d10ad9ae53081b1d01da05c3b70b801d9",
+"duckdb": "f20ef6ef9eda934959a2fe4128bce2b6a65215cf",
+"seconds": 1.035
+},
+{
+"rows": "56d650eaa0f40f06644320d12e3ee5d60a47f464",
+"duckdb": "d6feca28182d8b69044c56bd796a5d2fd05d0076",
+"seconds": 0.665
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.006
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.007
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.012
+},
+{
+"rows": "6a699f3017db65be0b389861ae7a9e0dc23c4f64",
+"duckdb": "1a4abf499fa4eca168c38339f5d78412ed0798fc",
+"seconds": 0.457
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.006
+},
+{
+"rows": "1f21f5b165125a7ad2eff6856a40bc536440435b",
+"duckdb": "d22d93a1b7f9379e669c0bea207615e5667237bc",
+"seconds": 0.648
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.008
+},
+{
+"rows": "0c7e82c5206ca84b1bbab5be008452198eb06c88",
+"duckdb": "bfd9e65a0ff03904598ec874032453056a580670",
+"seconds": 0.346
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.005
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.006
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.005
+},
+{
+"rows": "d355bff9b0a22461d68cdec4cbed14ec2e9e01be",
+"duckdb": "995392135edd2382848463d78a2410ea8ece4ad1",
+"seconds": 0.969
+},
+{
+"rows": "a61621f517d62a9fccbb34e22fa7a87beaccd4be",
+"duckdb": "660355d98ac902c55f4a04db32c4e224bfe564a6",
+"seconds": 0.468
+},
+{
+"rows": "97baf8937752912ef0410fd34ccd6b64502b0a4e",
+"duckdb": "3e26bf5de676d051089a621cb504212eea6078b3",
+"seconds": 0.658
+},
+{
+"rows": "c644b7565883bc16566bcd69a06616677d2d14fb",
+"duckdb": "21c01f4c42693c27c156734b6897e6577f13c9c6",
+"seconds": 0.469
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.006
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.009
+},
+{
+"rows": "c7fbc814d8f36d560a5cfe7d4e2a275e59844669",
+"duckdb": "992c4e988e1724485264f67b74e9682b3fcaa1a7",
+"seconds": 0.669
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.008
+},
+{
+"rows": "38fc336d65850722f369248625eae1a3bb745585",
+"duckdb": "4a5af1183b0a71d727f6f98a664d705577136656",
+"seconds": 0.657
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.005
+},
+{
+"rows": "8dce709af99df3dd55fc7a3dc45ebfadce8cbb89",
+"duckdb": "8ad9e6d5bc97fe336d6d07e52d362fb015104389",
+"seconds": 0.622
+},
+{
+"rows": "e7d6077a0796dff0782f21fa045a24bbfa0673d4",
+"duckdb": "e3e46011be7d4c448d0074dbfea325909f7abf8d",
+"seconds": 0.394
+},
+{
+"rows": "a48da67ff2f49cacc0f6cdfe58f94cee4a8f3042",
+"duckdb": "2372c3ff08315aeeb7be60928249a9c988f99e41",
+"seconds": 1.065
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.007
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.005
+},
+{
+"rows": "c06cffbc68586f10066f7ec418dfe46d31ce056c",
+"duckdb": "fb2043081bfa21500a1d4d10c11e0234857e47f8",
+"seconds": 0.673
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.007
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.006
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.008
+},
+{
+"rows": "c07b9fd7455bb6013f04c2ff1a14f4af3bbee592",
+"duckdb": "8f249bfb28fc306f18b9c523db6de837563016e4",
+"seconds": 0.408
+},
+{
+"rows": "b046bf5008b9605af212ef093391ba8ce4e57e22",
+"duckdb": "fbf5b9458162d46739aeab70af891864f582375c",
+"seconds": 0.333
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.008
+},
+{
+"rows": "5c70085da72f0562d0141b4df9d6901cd452a798",
+"duckdb": "76d7ff99b4e52261e2e115f8c850cdc6b9cc3822",
+"seconds": 0.609
+},
+{
+"rows": "1612abdc4e513abceec86f88b17f1523f65ac936",
+"duckdb": "afae2afe1a82d29579fb63a329caa06b15a0f6d5",
+"seconds": 0.472
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.009
+},
+{
+"rows": "d355bff9b0a22461d68cdec4cbed14ec2e9e01be",
+"duckdb": "9c181346668422904c8a8f0217144c55a4444d52",
+"seconds": 0.633
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.014
+},
+{
+"rows": "f91b1ee4a0380e3be3a02e5155a720155605e395",
+"duckdb": "8dc0034a8e136db1ae7b639f4ac6f1e0b3cbcde0",
+"seconds": 0.568
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.008
+},
+{
+"rows": "d6cd3c7a917ff393378aff3723e789b31d22feeb",
+"duckdb": "b9144e39a6d13cef9bac01b6086b4be0d35eab1d",
+"seconds": 0.355
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.006
+},
+{
+"rows": "71f2ccbe3f9c81cee27976fbf43ce99fd3d39c06",
+"duckdb": "e4e4b046a8b4446f257884fe915e2e6de022c85c",
+"seconds": 0.854
+},
+{
+"rows": "be29edda7f3a37f73fa2e2ab7626ca0055e787c0",
+"duckdb": "c8751fc409c0ad27bfaabd7920e63378599cf392",
+"seconds": 0.36
+},
+{
+"rows": "a670ab84b202290ac64ea8a0872c96f4fd91bc02",
+"duckdb": "37c7e9bf06c5e8fb4147219cbef903251c13b665",
+"seconds": 0.572
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.008
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.008
+},
+{
+"rows": "6a0c7c3d692b12316e8348fc3cd11f36e57c7852",
+"duckdb": "580e72df6d996ca3d216b425dce5d5580ca42046",
+"seconds": 0.721
+},
+{
+"rows": "a670ab84b202290ac64ea8a0872c96f4fd91bc02",
+"duckdb": "294a67f07e2945b455c7a7a538a14483ce852941",
+"seconds": 0.607
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.008
+},
+{
+"rows": "16099f7ad2fca8037e0d1c1e23a6603e3d48b5eb",
+"duckdb": "b833c4a12d4545ec59c9a79ca1e56d56de0bb6b5",
+"seconds": 0.372
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.007
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.01
+},
+{
+"rows": "498c32d1818b7b255ed50c6c48c2ab5657e19eb8",
+"duckdb": "c6be8e51de8eeb209ad60205a1acd0ccec430d74",
+"seconds": 0.561
+},
+{
+"rows": "da7d47a3e89af48aa7b891d15c529fb256a582af",
+"duckdb": "2f0da835bec86ea702df580dc90eb19000cacb55",
+"seconds": 0.637
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.006
+},
+{
+"rows": "2e28ba2bb198b560229d64ab717317cfb7463907",
+"duckdb": "b97251e98e8cca94e42f8afad9851384f1d094fe",
+"seconds": 0.563
+},
+{
+"rows": "705780b1542a8e2956ad58db8cc3d86e553bcea4",
+"duckdb": "56a2b79cef0ba4524ab6fe392a23ee7b6e577033",
+"seconds": 1.01
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.006
+},
+{
+"rows": "c0e938cb057213cd15ef352860ee2f1195a209d2",
+"duckdb": "f31b2c16dc0f7645cde9e963dc84afddb6e7ed4d",
+"seconds": 0.645
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.008
+},
+{
+"rows": "e7d6077a0796dff0782f21fa045a24bbfa0673d4",
+"duckdb": "1de11639735f1612cc41481aaf57226770eefa59",
+"seconds": 0.456
+},
+{
+"rows": "ab6ee3c471ffb5084703ae2eef22e2d9eb73c418",
+"duckdb": "8751bc3f85a68c701a81a0d201beb09b3e99f191",
+"seconds": 0.664
+},
+{
+"rows": "243cb7e936c85836029347fdbd29ae966742912a",
+"duckdb": "d5b0f0d270c209f2434884e97582a0bb7d6da6dc",
+"seconds": 0.861
+},
+{
+"rows": "fe09ece5d150a0827f1781c50a140b785158faeb",
+"duckdb": "443196e47e2d2176c9d9ed5879ed45f3e8ba6cf0",
+"seconds": 0.561
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.014
+},
+{
+"rows": "5c1654ecae343b7f05c546375215fca18745d887",
+"duckdb": "479f43e46d62ff1866fe79182f92208fbe97ec31",
+"seconds": 0.949
+},
+{
+"rows": "047a1bac6ecb7c331c644c00592fbe655efc405e",
+"duckdb": "941dff1850609546f7a264f98f1c6b377c89ec4f",
+"seconds": 0.412
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.011
+},
+{
+"rows": "3cb1f3b9129394459130a6a508e08cf90c5daa55",
+"duckdb": "febe29a5e6f16f33629864a80330a34bdd15acc7",
+"seconds": 0.444
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.005
+},
+{
+"rows": "a7d5743cf6d8e67d22ba0e601dda424038a075be",
+"duckdb": "cea89f0f852544f2921b81f7e18afd5465ad768d",
+"seconds": 0.841
+},
+{
+"rows": "b48859a355e1608f92f4633ed5e91d91674808e1",
+"duckdb": "f70d9a4027516dc812c99466daa41986c3fe59b1",
+"seconds": 0.385
+},
+{
+"rows": "d935c36f3093672d38208057582d2724562eb341",
+"duckdb": "dfe4d50bd2d3b326c02295555a16b34faf1618c0",
+"seconds": 0.6
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.005
+},
+{
+"rows": "c06cffbc68586f10066f7ec418dfe46d31ce056c",
+"duckdb": "f8748f7a936d9c80dab4b0b16dab289fc7e94758",
+"seconds": 0.695
+},
+{
+"rows": "1887676be1debd0521185a797cde020480102bb1",
+"duckdb": "b6835fbfe75c988f6b028194b26d25e113683f90",
+"seconds": 1.184
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.007
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.006
+},
+{
+"rows": "0ea52404a373a9dcee2a02b1d2073b978fbe10a7",
+"duckdb": "5d5215c058a01f3192470d9f961bd3721c07ecbe",
+"seconds": 0.57
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.005
+},
+{
+"rows": "fe77732fdc14ac60d0de5b875c5db0198bf7b965",
+"duckdb": "0e9587d712628ef89ce6f92dd52a88e74fb92fcb",
+"seconds": 0.571
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.007
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.007
+},
+{
+"rows": "c06cffbc68586f10066f7ec418dfe46d31ce056c",
+"duckdb": "03444c0c9a96c9fbf4ba392aba320a3ffd19a685",
+"seconds": 0.358
+},
+{
+"rows": "6667d5d55bbdcb2bfc87cab50b36cb5e805a379a",
+"duckdb": "ab08fe2944c1ed42acd84bfc20ae5edd91602ae0",
+"seconds": 0.529
+},
+{
+"rows": null,
+"duckdb": null,
+"seconds": 0.005
+},
+{
+"rows": "d806156020eec814635e7f2d2b662902c75899a9",
+"duckdb": "6d33af5f408f27d38511e7e50cb4cfbcb321f8d2",
+"seconds": 0.446
+}
+],
+"load_seconds": 0.598,
+"total_seconds": 70.2
+}

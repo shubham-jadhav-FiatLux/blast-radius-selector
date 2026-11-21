@@ -5,7 +5,7 @@ SQLGLOT ?= ../sqlglot
 OUT ?= out
 SEED ?= 0
 
-.PHONY: build sample profile map
+.PHONY: build sample profile map reference
 
 # The submission image.
 build:
@@ -28,8 +28,14 @@ PROFILES ?= $(OUT)/profile/trace_main.txt.gz $(OUT)/profile/trace_max_nodes.txt.
 WEAK ?= $(OUT)/profile/weak_main.txt.gz $(OUT)/profile/weak_max_nodes.txt.gz
 OUTCOMES ?= $(OUT)/profile/trace_main.json $(OUT)/profile/trace_max_nodes.json
 
+# Reference results of each TPC-DS query of test_execute_tpcds, for single-query re-checks.
+reference:
+	docker run --rm --user $$(id -u):$$(id -g) -v $(abspath $(SQLGLOT)):/src:ro -v $(CURDIR):/repo -w /repo $(PROFILE_IMAGE) \
+		python -S src/tpcds_check.py /src data/tpcds_reference.json
+
 # Turns the profiles and the pinned sources into data/map.bin.
 map:
 	docker run --rm --user $$(id -u):$$(id -g) -v $(abspath $(SQLGLOT)):/src:ro -v $(CURDIR):/repo -w /repo $(PROFILE_IMAGE) \
 		python profiling/build_map.py --src /src --out data/map.bin \
-		--profile $(PROFILES) --keys $(PROFILES) --weak $(WEAK) --outcomes $(OUTCOMES)
+		--profile $(PROFILES) --keys $(PROFILES) --weak $(WEAK) --outcomes $(OUTCOMES) \
+		--tpcds data/tpcds_reference.json

@@ -74,16 +74,45 @@ class TestWeakMatch(unittest.TestCase):
         line = "        if self.x is Strategy.UPPER and len(args) > 1:"
         c0 = line.index(" is ") + 1
         k0 = line.index("1:")
-        sites = [(c0, c0 + 2, "is", [("==", 7)]), (k0, k0 + 1, "1", [("2", 8), ("0", 9)])]
-        self.assertEqual(bs.Selector.weak_match(sites, line, line.replace(" is ", " == ")), 7)
-        self.assertEqual(bs.Selector.weak_match(sites, line, line.replace("> 1", "> 2")), 8)
+        sites = [(c0, c0 + 2, "is", [("==", 7, None)]), (k0, k0 + 1, "1", [("2", 8, (3, 5)), ("0", 9, None)])]
+        self.assertEqual(bs.Selector.weak_match(sites, line, line.replace(" is ", " == ")), (7, None))
+        self.assertEqual(bs.Selector.weak_match(sites, line, line.replace("> 1", "> 2")), (8, (3, 5)))
         self.assertIsNone(bs.Selector.weak_match(sites, line, line.replace(" and ", " or ")))
 
     def test_dropped_not(self):
         line = "    if not after_dot:"
         c0 = line.index("not ")
-        sites = [(c0, c0 + 4, "not ", [("", 3)])]
-        self.assertEqual(bs.Selector.weak_match(sites, line, "    if after_dot:"), 3)
+        sites = [(c0, c0 + 4, "not ", [("", 3, None)])]
+        self.assertEqual(bs.Selector.weak_match(sites, line, "    if after_dot:"), (3, None))
+
+
+class TestSelector(unittest.TestCase):
+    """A tiny hand-made map: one module with a runtime line, a comment-only edit, a test set."""
+
+    def selector(self):
+        info = {
+            "kind": bytes([1, 1, 0]), "flags": bytes(3), "sets": {1: 0, 2: 0}, "cols": {}, "argt": {},
+            "cattr": {}, "kattr": {}, "dflt": {}, "checks": set(), "units": [1, 2], "annot": {},
+            "weak": {}, "qsets": {}, "pure": set(), "users": -1, "sha1": "x",
+        }
+        blob = {"files": {"sqlglot/m.py": info}, "reads": {}, "scopes": {}, "sets": [0b101], "fresh": [], "core": []}
+        return bs.Selector(blob, "/nonexistent")
+
+    def patch(self, old, new, line=1):
+        return ("diff --git a/sqlglot/m.py b/sqlglot/m.py\n--- a/sqlglot/m.py\n+++ b/sqlglot/m.py\n"
+                "@@ -%d,1 +%d,1 @@\n-%s\n+%s\n" % (line, line, old, new))
+
+    def test_runtime_edit_charges_the_line_set(self):
+        bits, everything = self.selector().run(self.patch("    x = 1", "    x = 2"))[:2]
+        self.assertEqual((bits, everything), (0b101, False))
+
+    def test_comment_edit_is_free(self):
+        bits, everything = self.selector().run(self.patch("    x = 1", "    x = 1  # Cheap check first"))[:2]
+        self.assertEqual((bits, everything), (0, False))
+
+    def test_unknown_file_runs_everything(self):
+        text = self.patch("a", "b").replace("sqlglot/m.py", "sqlglot/other.py")
+        self.assertTrue(self.selector().run(text)[1])
 
 
 class TestPacking(unittest.TestCase):
