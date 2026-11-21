@@ -87,15 +87,31 @@ edited block:
 | default value of a function argument | tests that ran the function |
 | module level code in `tests/` | tests in that module and in every module importing it |
 | data file (SQL fixtures) | the tests that opened it |
-| anything that no longer compiles, config files, deletions and renames | all tests |
+| a module that no longer compiles or imports, or is deleted or renamed | the tests that use it or anything importing it: they ran its code, created or looked into its classes, import it (test files, at any depth), or ran an `import` inside a sqlglot function that would load it; all tests when `import sqlglot` itself loads it, or when the import hangs |
+| an import-time edit of a kind nothing above covers | the same, if the patched module no longer imports; otherwise all tests |
+| config files, files the map does not know | all tests |
 
 `test_execute_tpcds` (21.5 s, most of the cost whenever it is selected) runs about a hundred
 TPC-DS queries through sqlglot's executor and compares each with duckdb's answer for sqlglot's
-own transpiled SQL. The profile splits it into one context per query. When an edit reaches only
-a few queries, the selector replays those queries over the patched sources (`src/tpcds_check.py`)
-and leaves the test out if every one gives the same result table and the same duckdb SQL as at
-the pinned commit (digests in `data/tpcds_reference.json`). This is only tried when it is far
-cheaper than the test, and never when the patch touches `tests/`.
+own transpiled SQL. The profile splits it into one context per query, and
+`profiling/tpcds_stages.py` records, per query, which lines run in which step on the way to the
+plan (parsing, the pickle round trip, `find_tables`, each optimizer rule, the planner, the duckdb
+transpile) and which run after it (the executor itself). For a query the edit reaches, the
+selector re-checks the test over the patched sources (`src/tpcds_check.py`):
+
+* if the edit only reaches steps before the plan, the query passes when those steps give exactly
+  what they gave at the pinned commit. Steps that are optimizer rules or the planner are replayed
+  alone, from a checkpoint of their input saved while the image is built (an exact copy of the
+  tree: sqlglot's own pickling drops empty arguments, which the planner tells apart), and every
+  checkpoint is verified at build time to reproduce its step's output. Otherwise the whole path
+  to the plan runs again and the plan's digest is compared;
+* if something before the plan changed, or the edit reaches the executor, the query is executed
+  and passes when the result table and the duckdb SQL are the same as at the pinned commit
+  (`data/tpcds_reference.json`), within a CPU allowance based on how long it normally takes.
+
+The test is left out only when every reached query passes, the re-check is far cheaper than
+the test, and the patch does not touch `tests/`. Plan digests and checkpoints are computed with a
+fixed hash seed in the image that uses them.
 
 A class attribute, dict entry or default argument whose new value is anything but a plain
 literal (a new name, a call) always gets the import check, whatever the old value was.
@@ -107,8 +123,9 @@ stays conservative (an import that hangs counts as an import that fails).
 When an edited value is computed at import time by code that could fail on the new value, the
 patched modules and their importers are imported again over the pinned sources, in a forked
 child of the selector, and a failure is confirmed in a fresh interpreter. If they no longer
-import, all tests run. One test imports sqlglot in a subprocess, out of the profile's sight; it
-rides along whenever such an edit touches a module that `import sqlglot` itself loads.
+import, the tests that use them run (see the table). One test imports sqlglot in a subprocess,
+out of the profile's sight; it rides along whenever such an edit touches a module that
+`import sqlglot` itself loads.
 
 The chosen tests are then packed: longest-processing-time first for every worker count from 1
 to 8, followed by a little local search, minimising the busiest worker plus 2 s per worker.
@@ -148,7 +165,9 @@ data/sqlglot-src.tar.xz the pinned sqlglot sources (Python files and TPC-DS fixt
 src/fetch_sources.py    downloads the same sources from sqlglot's repository (alternative to make sources)
 src/import_baseline.py  build-time list of modules that fail to import even unpatched
 data/map.bin            the map built from the pinned commit
-profiling/              plugins (tracing, weak mutation), source indexer and map builder
+profiling/              plugins (tracing, weak mutation, class users), source indexer, the TPC-DS
+                        stage profiler and the map builder
+data/tpcds_stages.json  per TPC-DS query: lines run before and after the plan, and in which step
 eval/                   local scoring, synthetic edits and labelling
 ```
 

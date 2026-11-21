@@ -149,6 +149,15 @@ def _flush(ctx):
         import json
 
         _out.write("Y %s\t%s\n" % (ctx, json.dumps(sorted({(tag, _key_text(k)) for tag, k in keyed}))))
+    dyn = _dyn_imports.pop(ctx, None)
+    if dyn:
+        _out.write("M %s\t%s\n" % (ctx, ",".join(sorted(dyn))))
+    data = _data_reads.pop(ctx, None)
+    if data:
+        _out.write("D %s\t%s\n" % (ctx, ",".join(sorted(data))))
+    users = _users.pop(ctx, None)
+    if users:
+        _out.write("U %s\t%s\n" % (ctx, ",".join(sorted({_key_of(c) for c in users if c in _class_keys}))))
     weak = _weak.pop(ctx, None)
     if weak:
         _out.write("W %s\t%s\n" % (ctx, ",".join(map(str, sorted(weak)))))
@@ -247,7 +256,176 @@ def _record_missing_args():
 # required_args are covered by the validation records and key is derived from the class name.
 
 READS = os.environ.get("PROFILE_READS") == "1"
-_SKIP_EXPRESSION_ATTRS = {"arg_types", "required_args", "key"}
+# With PROFILE_USERS=1 every class attribute is recorded (arg_types too), and so is every class
+# a test instantiates or generates SQL for: "U <ctx>\t<class>,...". Edits nothing models more
+# precisely are charged to the users of the class or module they sit in.
+USERS = os.environ.get("PROFILE_USERS") == "1"
+# With PROFILE_DATA=1: before every test the dialect registry goes back to what `import sqlglot`
+# alone leaves in it, so a test that looks a dialect up by name loads it itself, and every
+# importlib.import_module a test makes is recorded ("M <ctx>\t<module>,..."): a module that no
+# longer imports fails exactly the tests that load it, even ones the registry used to spare. Lists
+# a test class's setUpClass loads from a SQL fixture are served as recording copies
+# ("P <tag>\t<fixture>\t<loader>", then "D <ctx>\t<tag>,..." for the tests that read them).
+DATA = os.environ.get("PROFILE_DATA") == "1"
+_dyn_imports = {}
+_data_reads = {}
+_registry_base = {}
+_SKIP_EXPRESSION_ATTRS = set() if USERS else {"arg_types", "required_args", "key"}
+_users = {}
+
+
+def _note_user(cls):
+    seen = _users.get(_ctx)
+    if seen is None:
+        seen = _users[_ctx] = set()
+    seen.add(cls)
+
+
+def _note(store, item):
+    seen = store.get(_ctx)
+    if seen is None:
+        seen = store[_ctx] = set()
+    seen.add(item)
+
+
+def _record_dynamic_imports():
+    import importlib
+
+    from sqlglot.dialects.dialect import Dialect
+
+    _registry_base.update({k: v for k, v in Dialect._classes.items() if v.__module__ == "sqlglot.dialects.dialect"})
+    original = importlib.import_module
+
+    def import_module(name, package=None):
+        if package is None and (name == "sqlglot" or name.startswith("sqlglot.")):
+            _note(_dyn_imports, name)
+        return original(name, package)
+
+    importlib.import_module = import_module
+
+
+def _reset_dialect_registry():
+    if not DATA:
+        return
+    dialect = sys.modules.get("sqlglot.dialects.dialect")
+    if dialect is not None:
+        classes = dialect.Dialect._classes
+        classes.clear()
+        classes.update(_registry_base)
+
+
+class _DataList(list):
+    """A list a test class's setUpClass loaded from a fixture: notes every test that reads it."""
+
+    __slots__ = ("_tag",)
+
+    def _seen(self):
+        _note(_data_reads, self._tag)
+
+    def __getitem__(self, i):
+        self._seen()
+        return list.__getitem__(self, i)
+
+    def __iter__(self):
+        self._seen()
+        return list.__iter__(self)
+
+    def __len__(self):
+        self._seen()
+        return list.__len__(self)
+
+    def __contains__(self, x):
+        self._seen()
+        return list.__contains__(self, x)
+
+    def __reversed__(self):
+        self._seen()
+        return list.__reversed__(self)
+
+    def __eq__(self, other):
+        self._seen()
+        return list.__eq__(self, other)
+
+    def __add__(self, other):
+        self._seen()
+        return list.__add__(self, other)
+
+    def __repr__(self):
+        self._seen()
+        return list.__repr__(self)
+
+    def __reduce_ex__(self, protocol):
+        self._seen()
+        return (list, (list(list.__iter__(self)),))
+
+    def index(self, *args):
+        self._seen()
+        return list.index(self, *args)
+
+    def count(self, x):
+        self._seen()
+        return list.count(self, x)
+
+    def copy(self):
+        self._seen()
+        return list.copy(self)
+
+
+def _serve_class_data(cls, before, fixture_ctx):
+    """After a class-level fixture: lists it put on the test class that equal what a tests.helpers
+    loader gives for a SQL fixture it read are replaced by recording copies."""
+    try:
+        from tests import helpers
+    except Exception:  # noqa: BLE001
+        return
+    read = sorted(p for p in _reads.get(fixture_ctx, ()) if p.startswith("tests/fixtures/") and p.endswith(".sql"))
+    if not read:
+        return
+    loaded = {}
+    for path in read:
+        rel = path[len("tests/fixtures/"):]
+        for loader in ("load_sql_fixture_pairs", "load_sql_fixtures"):
+            try:
+                loaded[(path, loader)] = list(getattr(helpers, loader)(rel))
+            except Exception:  # noqa: BLE001
+                pass
+    for name, value in list(vars(cls).items()):
+        if type(value) is not list or before.get(name) == id(value):
+            continue
+        for (path, loader), items in loaded.items():
+            if items == value:
+                tag = "%s.%s:%s" % (cls.__module__, cls.__qualname__, name)
+                data = _DataList(value)
+                data._tag = tag
+                setattr(cls, name, data)
+                _out.write("P %s\t%s\t%s\n" % (tag, path, loader))
+                break
+
+
+def _record_users():
+    from sqlglot import generator, parser, tokens
+    from sqlglot.dialects import dialect
+    from sqlglot.expressions import core
+
+    def wrap_init(klass):
+        original = klass.__init__
+
+        def __init__(self, *args, **kwargs):
+            _note_user(type(self))
+            return original(self, *args, **kwargs)
+
+        klass.__init__ = __init__
+
+    for klass in (core.Expr, dialect.Dialect, tokens.Tokenizer, parser.Parser, generator.Generator):
+        wrap_init(klass)
+    original_sql = generator.Generator.sql
+
+    def sql(self, expression, *args, **kwargs):
+        if isinstance(expression, core.Expr):
+            _note_user(type(expression))
+        return original_sql(self, expression, *args, **kwargs)
+
+    generator.Generator.sql = sql
 _attr_reads = {}
 _installed = []
 _class_keys = {}
@@ -612,6 +790,10 @@ def pytest_configure(config):
         _install_read_recorders()
         if KEYS:
             _record_dispatch_keys()
+    if USERS:
+        _record_users()
+    if DATA:
+        _record_dynamic_imports()
     _flush("<import>")
     _enter("<other>")
 
@@ -634,8 +816,13 @@ def pytest_fixture_setup(fixturedef, request):
         yield
         return
     prev = _ctx
-    _enter("<fixture>|%s|%s" % (fixturedef.scope, request.node.nodeid))
+    ctx = "<fixture>|%s|%s" % (fixturedef.scope, request.node.nodeid)
+    cls = getattr(request, "cls", None) if fixturedef.scope == "class" else None
+    before = {k: id(v) for k, v in vars(cls).items()} if DATA and cls is not None else None
+    _enter(ctx)
     yield
+    if before is not None:
+        _serve_class_data(cls, before, ctx)
     # Lines that ran inside the fixture stay disabled for the rest of this phase; they are
     # charged to every test in the fixture's scope when the map is built.
     _ctx = prev
@@ -644,6 +831,7 @@ def pytest_fixture_setup(fixturedef, request):
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_setup(item):
     _reset_runtime_caches()
+    _reset_dialect_registry()
     _enter(item.nodeid + "|setup")
     yield
     _flush(item.nodeid + "|setup")
@@ -717,7 +905,7 @@ def pytest_runtest_call(item):
         _enter(item.nodeid + "|call")
     else:
         yield
-    for ctx in [c for c in set(_lines) | set(_weak) | set(_attr_reads) | set(_reads) | set(_key_reads) if c.startswith(item.nodeid + "|call")]:
+    for ctx in [c for c in set(_lines) | set(_weak) | set(_attr_reads) | set(_reads) | set(_key_reads) | set(_users) | set(_dyn_imports) | set(_data_reads) if c.startswith(item.nodeid + "|call")]:
         _flush(ctx)
 
 
@@ -733,7 +921,7 @@ def pytest_runtest_teardown(item, nextitem):
 
 def pytest_sessionfinish(session, exitstatus):
     mon.set_events(TOOL, 0)
-    for ctx in list(set(_lines) | set(_reads) | set(_missing) | set(_attr_reads) | set(_weak) | set(_key_reads)):
+    for ctx in list(set(_lines) | set(_reads) | set(_missing) | set(_attr_reads) | set(_weak) | set(_key_reads) | set(_users) | set(_dyn_imports) | set(_data_reads)):
         _flush(ctx)
     if WEAK:
         import json

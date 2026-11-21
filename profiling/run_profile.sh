@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Runs the sqlglot suite under the tracing plugin, twice:
-#   trace  line coverage, file reads, validation, class attribute reads and dict keys
+#   trace  line coverage, file reads, validation, class attribute reads, dict keys and the
+#          classes each test creates or generates SQL for
 #   weak   comparisons and boolean operators evaluated against their swapped forms
 #   profiling/run_profile.sh <profile image> <sqlglot checkout> <output dir> [seed]
 # test_max_nodes needs about 1.7 GB on its own, so each pass runs it in a second container.
@@ -10,10 +11,10 @@ plugins=$(cd "$(dirname "$0")" && pwd)
 chmod 777 "$out"
 run() {
   local name=$1 mode=$2 memory=$3; shift 3
-  local keys=0; [ "$mode" = PROFILE_READS ] && keys=1
+  local keys=0; [ "$mode" = PROFILE_READS ] && keys=1  # the trace pass also records dict keys and class users
   docker run --rm --cpus 2 --memory "$memory" --memory-swap "$memory" \
     -v "$src:/src:ro" -v "$plugins:/plugins:ro" -v "$out:/out" \
-    -e PYTHONPATH=/src:/plugins -e "$mode=1" -e PROFILE_KEYS="$keys" -e PYTHONHASHSEED="$seed" \
+    -e PYTHONPATH=/src:/plugins -e "$mode=1" -e PROFILE_KEYS="$keys" -e PROFILE_USERS="$keys" -e PYTHONHASHSEED="$seed" \
     -e PROFILE_OUT="/out/$name.txt.gz" -e OUTCOME_OUT="/out/$name.json" \
     -w /src "$image" python -m pytest -q -p trace_plugin -p outcome_plugin -p no:cacheprovider \
     --timeout 1800 "$@" > "$out/$name.log" 2>&1

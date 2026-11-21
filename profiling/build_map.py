@@ -32,6 +32,8 @@ GLOBAL = -2
 FRESH_INTERPRETER_TESTS = ("tests/dialects/test_dialect.py::TestDialect::test_lazy_load",)
 # Split into one profile context per query; the selector can re-check single queries of it.
 PER_QUERY_TEST = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+# The steps of each of its queries up to the plan; must match src/tpcds_check.py STEPS.
+TPCDS_STEPS = ["parse", "pickle", "tables", "pre"] + ["rule%d" % i for i in range(14)] + ["plan", "duckdb"]
 OUTSIDE = -1  # touched outside any single query
 FORMAT = 1
 PINNED = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
@@ -89,6 +91,10 @@ def read_profile(paths, meta=None):
                     ofid, oline = item.split(":")
                     dest.add((files[int(ofid)], int(oline)))
                 continue
+            if kind == "P":
+                tag, path, loader = (rest.split("\t") + ["", ""])[:3]
+                meta.setdefault("provenance", {})[tag] = (path, loader)
+                continue
             if kind == "K":
                 key, mro, parts = (rest.split("\t") + ["", ""])[:3]
                 meta["families"][key] = (tuple(m for m in mro.split("|") if m), tuple(p for p in parts.split("|") if p))
@@ -109,6 +115,12 @@ def read_profile(paths, meta=None):
                 entry["attrs"].update(payload.split(","))
             elif kind == "W" and payload:
                 entry.setdefault("weak", set()).update(int(c) for c in payload.split(","))
+            elif kind == "U" and payload:
+                entry.setdefault("users", set()).update(payload.split(","))
+            elif kind == "M" and payload:
+                entry.setdefault("dyn", set()).update(payload.split(","))
+            elif kind == "D" and payload:
+                entry.setdefault("data", set()).update(payload.split(","))
             elif kind == "Y" and payload:
                 entry.setdefault("keys", set()).update((tag, k) for tag, k in json.loads(payload))
     return contexts
@@ -177,7 +189,7 @@ class SetTable:
         return sid
 
 
-def per_query_reference(path, index):
+def per_query_reference(path, index, staged=False):
     """Reference digests and timings for the per-query test, or None."""
     if not path or index is None:
         return None
@@ -189,7 +201,77 @@ def per_query_reference(path, index):
         "rows": [q["rows"] for q in ref["queries"]],
         "duckdb": [q["duckdb"] for q in ref["queries"]],
         "seconds": [q["seconds"] for q in ref["queries"]],
+        "staged": staged,  # files carry "xq": the queries an edited line reaches after planning
     }
+
+
+def import_time_instances():
+    """Classes of the expression nodes that exist right after import: SQL templates parsed into
+    module globals, class attributes, defaults and closures. An edit to such a class can change
+    those nodes, which tests then use without ever creating one, so it is not charged to the
+    class's users alone."""
+    from sqlglot.expressions import core
+
+    out, seen, stack = set(), set(), []
+    for name, mod in list(sys.modules.items()):
+        if name.split(".")[0] == "sqlglot" and mod is not None:
+            stack.extend(vars(mod).values())
+    while stack:
+        value = stack.pop()
+        if id(value) in seen:
+            continue
+        seen.add(id(value))
+        if isinstance(value, core.Expr):
+            out.add("%s.%s" % (type(value).__module__, type(value).__qualname__))
+            stack.extend(value.args.values())
+        elif isinstance(value, type):
+            if (value.__module__ or "").split(".")[0] == "sqlglot":
+                stack.extend(vars(value).values())
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            stack.extend(value)
+        elif isinstance(value, dict):
+            stack.extend(value.keys())
+            stack.extend(value.values())
+        elif isinstance(value, (staticmethod, classmethod)):
+            stack.append(value.__func__)
+        elif callable(value) and hasattr(value, "__code__"):
+            stack.extend(value.__defaults__ or ())
+            stack.extend((value.__kwdefaults__ or {}).values())
+            for cell in value.__closure__ or ():
+                try:
+                    stack.append(cell.cell_contents)
+                except ValueError:
+                    pass
+    return out
+
+
+_DIALECT_ATTR = re.compile(r"dialects\.([A-Z][A-Za-z0-9]*)\b")
+
+
+def test_module_imports(src, files, modules):
+    """test file -> sqlglot modules it imports anywhere, including inside test methods and the
+    lazy ``from sqlglot.dialects import MySQL`` / ``sqlglot.dialects.MySQL`` forms."""
+    out = {}
+    for rel, ix in files.items():
+        if not rel.startswith("tests/"):
+            continue
+        found = set()
+        for level, mod, names in ix.get("all_imports", ()):
+            if level:
+                continue
+            for target in [mod] + ["%s.%s" % (mod, n) for n in names]:
+                if target in modules:
+                    found.add(target)
+                if mod == "sqlglot.dialects":
+                    for n in names:
+                        if "sqlglot.dialects." + n.lower() in modules:
+                            found.add("sqlglot.dialects." + n.lower())
+        with open(os.path.join(src, rel), encoding="utf-8") as f:
+            for n in _DIALECT_ATTR.findall(f.read()):
+                if "sqlglot.dialects." + n.lower() in modules:
+                    found.add("sqlglot.dialects." + n.lower())
+        out[rel] = found
+    return out
 
 
 def core_modules(src):
@@ -350,6 +432,7 @@ def main():
     ap.add_argument("--weak-outcomes", nargs="*", default=[], help="outcomes of the weak runs")
     ap.add_argument("--keys", nargs="*", default=[], help="profiles recorded with PROFILE_KEYS=1 (also in --profile)")
     ap.add_argument("--tpcds", default=None, help="reference fingerprints from src/tpcds_check.py")
+    ap.add_argument("--tpcds-stages", default=None, help="front/back lines per query from profiling/tpcds_stages.py")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     src = os.path.abspath(args.src)
@@ -372,6 +455,21 @@ def main():
     pq_bit = 1 << pq_index if pq_index is not None else 0
     pq_prefix = PER_QUERY_TEST + "|call#q"
     qcov = defaultdict(set)  # (rel, line) -> queries of the per-query test that ran it (or OUTSIDE)
+    # Per query, which lines run before the plan exists (front) and which anywhere else (back);
+    # an edit only the front reaches is re-checked by comparing plans instead of results.
+    stage_front, stage_back = defaultdict(set), defaultdict(set)
+    stage_modes = {}  # (rel, line) -> bitmask of the steps (tpcds_check.STEPS) it ran in
+    if args.tpcds_stages and pq_index is not None:
+        with open(args.tpcds_stages) as f:
+            stages = json.load(f)
+        bit = {name: 1 << i for i, name in enumerate(TPCDS_STEPS)}
+        for rel, lines in stages.get("modes", {}).items():
+            for ln, modes in lines.items():
+                stage_modes[(rel, int(ln))] = sum(bit.get(m, bit["pre"]) for m in set(modes))
+        for name, target in (("front", stage_front), ("back", stage_back)):
+            for rel, lines in stages[name].items():
+                for ln, queries in lines.items():
+                    target[(rel, int(ln))].update(queries)
     for ctx, entry in contexts.items():
         charged = tests.resolve(ctx)
         query = int(ctx[len(pq_prefix):]) if ctx.startswith(pq_prefix) else None
@@ -564,32 +662,120 @@ def main():
     if not meta["families"]:
         print("build_map: profile has no class records; import-time edits will run everything", file=sys.stderr)
 
+    # ------------------------------------------------------------- users of classes and modules
+    # Edits nothing above models (an arg_types key renamed, a statement dropped, a module that
+    # no longer imports) reach only tests that use the class or module they sit in: tests that
+    # instantiated it or a subclass, generated SQL for it, read its attributes or ran its code.
+    user_bits = defaultdict(int)
+    user_global = set()
+    for ctx, entry in contexts.items():
+        found = entry.get("users")
+        if not found:
+            continue
+        charged = tests.resolve(ctx)
+        for key in found:
+            if charged == GLOBAL:
+                user_global.add(key)
+            else:
+                user_bits[key] |= charged
+    owner_reads = defaultdict(int)
+    for tag, bits in attr_reads.items():
+        owner_reads[tag.rpartition(":")[0]] |= bits
+    owner_global = {tag.rpartition(":")[0] for tag in attr_global}
+    method_cov = defaultdict(int)
+    module_cov = defaultdict(int)
+    for rel, ix in files.items():
+        if not rel.startswith("sqlglot/"):
+            continue
+        mod = module_name(rel)
+        for ln, qual in ix.get("class_of", {}).items():
+            bits = cov.get((rel, ln), 0)
+            if bits:
+                method_cov["%s.%s" % (mod, qual)] |= bits
+    for (rel, ln), bits in cov.items():
+        if rel.startswith("sqlglot/"):
+            module_cov[module_name(rel)] |= bits
+    templated = import_time_instances() if user_bits else set()
+    class_cache = {}
+
+    def class_users(key):
+        if not user_bits:
+            return GLOBAL
+        if key not in class_cache:
+            members = effects.family(key) if key in meta["families"] else {key}
+            bits = 0
+            for member in members:
+                if member in templated or member in user_global or member in owner_global:
+                    bits = GLOBAL
+                    break
+                bits |= user_bits.get(member, 0) | owner_reads.get(member, 0) | method_cov.get(member, 0)
+            class_cache[key] = bits
+        return class_cache[key]
+
     out_files = {}
     for rel, ix in files.items():
         kind = ix["kind"]
         spans = ix["spans"]
         sets = {}
         qsets = {}
+        xq = {}
         checks = []
+        def span_set(a, b):
+            """The set id for an edit anywhere in lines a..b, with the per-query test's queries
+            it reaches (None: unknown, so the whole test) and those it reaches after planning."""
+            bits = union_eff(rel, range(a, b + 1))
+            staged = set()
+            for l2 in range(a, b + 1):
+                staged |= stage_front.get((rel, l2), set()) | stage_back.get((rel, l2), set())
+            if staged and bits != GLOBAL:
+                bits |= pq_bit  # the per-query replay saw the test run it even if the profile did not
+            sid = table.add(bits)
+            if sid < 0 or not table.sets[sid] & pq_bit:
+                return sid, None, ()
+            queries = set()
+            for l2 in range(a, b + 1):
+                seen = qcov.get((rel, l2), set())
+                if "unsplit" in seen and not any(isinstance(q, int) and q >= 0 for q in seen):
+                    queries.add(OUTSIDE)  # only the unsplit runs saw the test here
+                queries |= {q for q in seen if q != "unsplit"}
+                if (rel, l2) in via_import:
+                    queries.add(OUTSIDE)
+            queries |= staged
+            if not queries or OUTSIDE in queries:
+                return sid, None, ()
+            back = set()
+            if stage_front or stage_back:
+                for l2 in range(a, b + 1):
+                    back |= stage_back.get((rel, l2), set())
+                    for q in qcov.get((rel, l2), ()):
+                        # seen by the profile but by neither stage of the replay: back
+                        if isinstance(q, int) and q >= 0 and q not in stage_front.get((rel, l2), ()) \
+                                and q not in stage_back.get((rel, l2), ()):
+                            back.add(q)
+            return sid, tuple(sorted(queries)), tuple(sorted(back & queries))
+
+        def span_steps(a, b):
+            mask = 0
+            for l2 in range(a, b + 1):
+                mask |= stage_modes.get((rel, l2), 0)
+            return mask
+
+        stg = {}
         for ln in range(1, ix["n"] + 1):
             k = kind[ln - 1]
             if k not in (RUNTIME, MIXED):
                 continue
             a, b = spans[ln - 1]
-            sid = table.add(union_eff(rel, range(a, b + 1)))
+            sid, queries, back = span_set(a, b)
             if sid != NO_TESTS:
                 sets[ln] = sid
-                if sid >= 0 and table.sets[sid] & pq_bit:
-                    queries = set()
-                    for l2 in range(a, b + 1):
-                        seen = qcov.get((rel, l2), set())
-                        if "unsplit" in seen and not any(isinstance(q, int) and q >= 0 for q in seen):
-                            queries.add(OUTSIDE)  # only the unsplit runs saw the test here
-                        queries |= {q for q in seen if q != "unsplit"}
-                        if (rel, l2) in via_import:
-                            queries.add(OUTSIDE)
-                    if queries and OUTSIDE not in queries:
-                        qsets[ln] = tuple(sorted(queries))
+                if queries:
+                    qsets[ln] = queries
+                    if back:
+                        xq[ln] = back
+                    steps = span_steps(a, b)
+                    if steps:
+                        stg[ln] = steps
             if any((rel, l2) in via_import for l2 in range(a, b + 1)):
                 checks.append(ln)  # the edited code also ran at import time; it could now fail there
 
@@ -645,11 +831,22 @@ def main():
                         check = True
                 cattr[ln] = (table.add(bits), check)
         for ln, entries in ix["defaults"].items():
+            # a default reaches whoever ran the function's body:
+            # (c0, c1, set, check, queries, back, steps)
             dflt[ln] = [
-                (c0, c1, table.add(union_eff(rel, range(b0, b1 + 1))),
-                 any((rel, l2) in via_import for l2 in range(b0, b1 + 1)))
+                (c0, c1, *span_set(b0, b1)[:1], any((rel, l2) in via_import for l2 in range(b0, b1 + 1)),
+                 *span_set(b0, b1)[1:], span_steps(b0, b1))
                 for c0, c1, b0, b1 in entries
             ]
+
+        class_fb = []
+        if rel.startswith("sqlglot/"):
+            spans = {}
+            for ln, qual in ix.get("class_of", {}).items():
+                a, b = spans.get(qual, (ln, ln))
+                spans[qual] = (min(a, ln), max(b, ln))
+            for qual, (a, b) in sorted(spans.items(), key=lambda x: x[1][1] - x[1][0]):
+                class_fb.append((a, b, table.add(class_users("%s.%s" % (module_name(rel), qual)))))
 
         users = module_users.get(rel, 0)
         out_files[rel] = {
@@ -659,10 +856,13 @@ def main():
             "cols": ix["runtime_cols"],
             "argt": argt,
             "cattr": cattr,
+            "class_fb": class_fb,
             "kattr": kattr,
             "dflt": dflt,
             "checks": set(checks),
             "qsets": qsets,
+            "xq": xq,
+            "stg": stg,
             "units": [x for unit in ix["units"] for x in unit],
             "annot": ix["annotations"],
             "pure": set(ix["pure"]),
@@ -671,6 +871,23 @@ def main():
         }
 
     openers = defaultdict(int)
+    # A SQL fixture a test class's setUpClass loads into a list is read, for the profile, by
+    # every test in the class. The tests that actually used that list are known (D records), so
+    # for such a file there is also a narrower answer: (loader, its readers outside those class
+    # fixtures plus the list's users, the same without the per-query test). The selector uses it
+    # when the patched file still loads.
+    provenance = meta.get("provenance", {})
+    tags_of = defaultdict(set)
+    for tag, (path, loader) in provenance.items():
+        tags_of[path].add((tag, loader))
+    narrow = defaultdict(int)
+    data_users = defaultdict(int)
+    for ctx, entry in contexts.items():
+        found = entry.get("data")
+        if found:
+            charged = tests.resolve(ctx)
+            for tag in found:
+                data_users[tag] = GLOBAL if charged == GLOBAL or data_users[tag] == GLOBAL else data_users[tag] | charged
     for ctx, entry in contexts.items():
         charged = tests.resolve(ctx)
         for path in entry["reads"]:
@@ -680,6 +897,25 @@ def main():
                 openers[path] = GLOBAL
             else:
                 openers[path] |= charged
+            class_fixture = ctx.startswith("<fixture>|class|") and path in tags_of
+            if not class_fixture:
+                narrow[path] = GLOBAL if charged == GLOBAL or narrow[path] == GLOBAL else narrow[path] | charged
+    class_data = {}
+    for path, entries in tags_of.items():
+        loaders = {loader for _tag, loader in entries}
+        bits = narrow.get(path, 0)
+        for tag, _loader in entries:
+            got = data_users.get(tag, 0)
+            bits = GLOBAL if bits == GLOBAL or got == GLOBAL else bits | got
+        if len(loaders) != 1 or bits == GLOBAL or openers.get(path) == GLOBAL:
+            continue
+        rel_fixture = path
+        try:
+            with open(os.path.join(src, rel_fixture), "rb") as f:
+                digest = hashlib.sha1(f.read()).hexdigest()
+        except OSError:
+            continue
+        class_data[path] = (loaders.pop(), table.add(bits), table.add(bits & ~pq_bit) if pq_bit else table.add(bits), digest)
 
     # ------------------------------------------------------------- weak mutation sites
     # Each weak run numbers its sites itself, so runs are merged by what a site is (file,
@@ -784,18 +1020,92 @@ def main():
                     stack.append(imp)
         out_files[rel]["importers"] = sorted(seen)
 
+    core = set(core_modules(src))
+    imports_by_test = test_module_imports(src, files, set(modules))
+    # importlib.import_module calls per test (PROFILE_DATA=1), the dialect registry being reset
+    # before each test so that loading a dialect by name always shows
+    dyn_users = defaultdict(int)
+    for ctx, entry in contexts.items():
+        found = entry.get("dyn")
+        if not found:
+            continue
+        charged = tests.resolve(ctx)
+        for mod in found:
+            dyn_users[mod] = GLOBAL if charged == GLOBAL or dyn_users[mod] == GLOBAL else dyn_users[mod] | charged
+    # import statements inside sqlglot functions: (rel, line, modules the statement may import)
+    try:
+        import sqlglot.dialects as dialects_pkg
+
+        by_attribute = dict(getattr(dialects_pkg, "MODULE_BY_ATTRIBUTE", {}))
+    except Exception:  # noqa: BLE001
+        by_attribute = {}
+    lazy = []
+    for rel, ix in files.items():
+        if not rel.startswith("sqlglot/"):
+            continue
+        here = module_name(rel)
+        package = here if rel.endswith("__init__.py") else here.rpartition(".")[0]
+        for ln, level, mod, names in ix.get("lazy_imports", ()):
+            base = mod
+            if level:
+                parts = package.split(".")
+                base = ".".join(parts[: len(parts) - (level - 1)] + ([mod] if mod else []))
+            targets = {base}
+            for n in names:
+                targets.add("%s.%s" % (base, n))
+                if base == "sqlglot.dialects":
+                    targets.add("sqlglot.dialects.%s" % by_attribute.get(n, n.lower()))
+            lazy.append((rel, ln, {t for t in targets if t in modules}))
+    for rel in modules.values():
+        me = module_name(rel)
+        group = {me} | set(out_files[rel]["importers"])
+        if not user_bits or group & core:
+            out_files[rel]["module_fb"] = GLOBAL
+            continue
+        bits = 0
+        for mod in group:
+            mod_rel = modules.get(mod)
+            bits |= module_cov.get(mod, 0)
+            for qual in set(files[mod_rel].get("class_of", {}).values()) if mod_rel else ():
+                got = class_users("%s.%s" % (mod, qual))
+                if got == GLOBAL:
+                    bits = GLOBAL
+                    break
+                bits |= got
+            if bits == GLOBAL:
+                break
+        if bits != GLOBAL:
+            for test_rel, mods in imports_by_test.items():
+                if mods & group:
+                    bits |= tests.scope(test_rel)
+            for mod in group:
+                got = dyn_users.get(mod, 0)
+                if got == GLOBAL:
+                    bits = GLOBAL
+                    break
+                bits |= got
+            for rel2, ln, targets in lazy:
+                if targets & group:
+                    got = union_eff(rel2, [ln])  # whoever ran that import statement
+                    if got == GLOBAL:
+                        bits = GLOBAL
+                        break
+                    bits |= got
+        out_files[rel]["module_fb"] = table.add(bits) if bits != GLOBAL else GLOBAL
+
     blob = {
         "format": FORMAT,
         "commit": PINNED,
         "tests": tests.ids,
         "files": out_files,
         "reads": {p: (GLOBAL if b == GLOBAL else table.add(b)) for p, b in openers.items()},
+        "class_data": class_data,
         "scopes": {p: table.add(b) for p, b in scopes.items()},
         # tests that import sqlglot in a fresh interpreter, which the profile cannot see into,
         # and the modules such an "import sqlglot" loads
         "fresh": [tests.index[t] for t in FRESH_INTERPRETER_TESTS if t in tests.index],
-        "core": core_modules(src),
-        "per_query": per_query_reference(args.tpcds, pq_index),
+        "core": sorted(core),
+        "per_query": per_query_reference(args.tpcds, pq_index, bool(args.tpcds_stages)),
         "sets": table.sets,
     }
     data = zlib.compress(marshal.dumps(blob), 9)

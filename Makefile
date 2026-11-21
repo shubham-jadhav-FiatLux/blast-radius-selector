@@ -5,7 +5,7 @@ SQLGLOT ?= ../sqlglot
 OUT ?= out
 SEED ?= 0
 
-.PHONY: build sample profile map reference sources
+.PHONY: build sample profile map reference sources stages
 
 # The submission image.
 build:
@@ -34,14 +34,20 @@ reference:
 	docker run --rm --user $$(id -u):$$(id -g) -v $(abspath $(SQLGLOT)):/src:ro -v $(CURDIR):/repo -w /repo $(PROFILE_IMAGE) \
 		python -S src/tpcds_check.py /src data/tpcds_reference.json
 
+# Per TPC-DS query of test_execute_tpcds: the lines run before and after its plan, and in which step.
+stages:
+	docker run --rm --user $$(id -u):$$(id -g) -e PYTHONHASHSEED=0 -v $(abspath $(SQLGLOT)):/src:ro -v $(CURDIR):/repo -w /repo $(PROFILE_IMAGE) \
+		python profiling/tpcds_stages.py /src data/tpcds_stages.json
+
 # Turns the profiles and the pinned sources into data/map.bin.
 map:
 	docker run --rm --user $$(id -u):$$(id -g) -v $(abspath $(SQLGLOT)):/src:ro -v $(CURDIR):/repo -w /repo $(PROFILE_IMAGE) \
 		python profiling/build_map.py --src /src --out data/map.bin \
 		--profile $(PROFILES) --keys $(PROFILES) --weak $(WEAK) --weak-outcomes $(WEAK_OUTCOMES) --outcomes $(OUTCOMES) \
-		--tpcds data/tpcds_reference.json
+		--tpcds data/tpcds_reference.json --tpcds-stages data/tpcds_stages.json
 
-# The pinned sources the image checks patches against (sqlglot's Python files and TPC-DS fixtures).
+# The pinned sources the image checks patches against (sqlglot's Python files, its SQL fixtures and
+# the TPC-DS data).
 sources:
-	cd $(SQLGLOT) && git ls-files '*.py' LICENSE tests/fixtures/optimizer/tpc-ds | \
+	cd $(SQLGLOT) && git ls-files '*.py' LICENSE tests/fixtures/optimizer/tpc-ds 'tests/fixtures/*.sql' | sort -u | \
 		tar cJf $(CURDIR)/data/sqlglot-src.tar.xz --owner=0 --group=0 --mtime=2026-01-01 -T -

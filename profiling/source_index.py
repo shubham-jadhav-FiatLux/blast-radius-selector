@@ -576,6 +576,53 @@ def compile_units(tree) -> list[tuple[int, int]]:
     return sorted(units)
 
 
+def class_lines(tree) -> dict[int, str]:
+    """line -> qualified name of the innermost class whose body (methods included) holds it."""
+    out = {}
+
+    def walk(node, qual):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.ClassDef):
+                name = qual + [child.name]
+                for ln in range(child.lineno, (child.end_lineno or child.lineno) + 1):
+                    out[ln] = ".".join(name)
+                walk(child, name)
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                walk(child, qual + [child.name, "<locals>"])
+            else:
+                walk(child, qual)
+
+    walk(tree, [])
+    return out
+
+
+def all_imports(tree) -> list[tuple[int, str, tuple[str, ...]]]:
+    """Every import statement, wherever it sits (tests import dialects inside test methods)."""
+    out = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                out.add((0, alias.name, ()))
+        elif isinstance(node, ast.ImportFrom):
+            out.add((node.level, node.module or "", tuple(a.name for a in node.names)))
+    return sorted(out)
+
+
+def lazy_imports(tree) -> list[tuple[int, int, str, tuple[str, ...]]]:
+    """Import statements inside function bodies: (line, level, module, names). They run when
+    the function does, so a module that no longer imports breaks whoever calls them."""
+    out = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Import):
+                    for alias in sub.names:
+                        out.add((sub.lineno, 0, alias.name, ()))
+                elif isinstance(sub, ast.ImportFrom):
+                    out.add((sub.lineno, sub.level, sub.module or "", tuple(a.name for a in sub.names)))
+    return sorted(out)
+
+
 def index_source(source: str) -> dict:
     """Everything the selector needs to know about one file, as plain data."""
     ix = _Indexer(source)
@@ -610,5 +657,8 @@ def index_source(source: str) -> dict:
         "units": compile_units(tree),
         "annotations": ix.annotations,
         "dict_entries": ix.dict_entries,
+        "class_of": class_lines(tree),
+        "all_imports": all_imports(tree),
+        "lazy_imports": lazy_imports(tree),
         "dict_displays": ix.dict_displays,
     }
