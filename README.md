@@ -25,6 +25,14 @@ labelled its commits in (`profiling/`):
      attribute of every sqlglot class is swapped for a descriptor that returns the same object
      and notes the read.
 
+   A second pass (`weak_rewrite.py`) observes the "changes the state" step for the most common
+   edits. Every comparison and condition inside a sqlglot function is rewritten so that it
+   evaluates the swapped form next to the real one: `a <= b` next to `a < b`, `a == b` next to
+   `a is b`, `n + 1` and `n - 1` next to a constant `n`, and `x or y` next to `x and y` where
+   only the truth value is used. The pass records, per test, which swaps would have produced
+   a different result. The program still sees only the original results, and all 1,620 tests
+   still pass under the rewrite.
+
    A few details make the attribution trustworthy:
    - every sqlglot module is imported before collection, so lazily loaded dialects do not
      charge their import-time work to whichever test happened to touch them first;
@@ -54,7 +62,8 @@ edited block:
 | Edit | Tests charged |
 | --- | --- |
 | comment or blank line outside a string literal (Python files only) | none |
-| inside a function body | every test that ran any line of the enclosing statement (with `and`/`or` short-circuiting, a test can depend on a statement without running the edited line), plus the readers of anything that code computed while sqlglot was being imported |
+| a comparison, constant in a comparison, or condition swapped for one the weak pass observed | the tests in which that swap would have changed a result; an `is` that can never differ from `==` for the values actually seen costs nothing |
+| any other edit inside a function body | every test that ran any line of the enclosing statement (with `and`/`or` short-circuiting, a test can depend on a statement without running the edited line), plus the readers of anything that code computed while sqlglot was being imported |
 | inside a lambda that an import-time table holds | the tests that called it |
 | `arg_types` flag flipped | tests that validated a node of an affected class while that argument was missing (`arg_types` values only feed `required_args`); affected classes are the class itself, its subclasses, and classes splicing in its dict |
 | other class attribute or module constant | tests that read it, or anything derived from it, on the defining class, its subclasses, or the dialects built from them; `{**Parser.FUNCTIONS}` resolves to `Parser`, not to whichever parser happens to be nearby |
@@ -64,16 +73,17 @@ edited block:
 | anything that no longer compiles, config files, deletions and renames | all tests |
 
 When an edited value is computed at import time by code that could fail on the new value, the
-patched modules and their importers are imported in a fresh interpreter. If that fails, all
-tests run.
+patched modules and their importers are imported again over the pinned sources, in a forked
+child of the selector, and a failure is confirmed in a fresh interpreter. If they no longer
+import, all tests run.
 
 The chosen tests are then packed: longest-processing-time first for every worker count from 1
 to 8, followed by a little local search, minimising the busiest worker plus 2 s per worker.
 
 ## Results on the sample
 
-On the kit's 30 sample commits: **163.3 s simulated, 0 misses**, using about 1 s of CPU for the
-whole batch. For comparison, running everything costs 1,104 s, and an oracle that knows the
+On the kit's 30 sample commits: **111.1 s simulated, 0 misses**, using well under 1 s of CPU
+for the whole batch. For comparison, running everything costs 1,104 s, and an oracle that knows the
 failing tests costs 94.4 s.
 
 `eval/mutants.py` generates synthetic edits with the same operators, and `eval/label.py` labels
@@ -83,8 +93,8 @@ them by running the full suite on each, which gives a test bed far beyond the 30
 
 ```sh
 make sample KIT=path/to/kit          # build, run under the scorer's limits, score, per-commit table
-make profile SQLGLOT=path/to/sqlglot # re-profile the suite at the pinned commit
-make map SQLGLOT=path/to/sqlglot     # rebuild data/map.bin from that profile
+make profile SQLGLOT=path/to/sqlglot # re-profile the suite at the pinned commit (both passes)
+make map SQLGLOT=path/to/sqlglot     # rebuild data/map.bin from those profiles
 ```
 
 `KIT` is the unpacked starter kit (it holds `sample/` and `score.py`). `SQLGLOT` is a checkout
@@ -98,7 +108,7 @@ src/blast_select.py     the selector
 src/fetch_sources.py    build-time download of the pinned sqlglot sources
 src/import_baseline.py  build-time list of modules that fail to import even unpatched
 data/map.bin            the map built from the pinned commit
-profiling/              plugins, source indexer and map builder
+profiling/              plugins (tracing, weak mutation), source indexer and map builder
 eval/                   local scoring, synthetic edits and labelling
 ```
 

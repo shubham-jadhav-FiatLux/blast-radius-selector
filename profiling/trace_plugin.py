@@ -143,6 +143,9 @@ def _flush(ctx):
     attrs = _attr_reads.pop(ctx, None)
     if attrs:
         _out.write("R %s\t%s\n" % (ctx, ",".join(sorted(attrs))))
+    weak = _weak.pop(ctx, None)
+    if weak:
+        _out.write("W %s\t%s\n" % (ctx, ",".join(map(str, sorted(weak)))))
 
 
 class InlineExecutor:
@@ -369,13 +372,60 @@ def _reinstall_read_recorders():
             type.__setattr__(cls, name, desc)
 
 
+# ----------------------------------------------------------------------------- weak mutation
+# With PROFILE_WEAK=1 sqlglot is imported through a loader that rewrites comparisons and boolean
+# operators (see weak_rewrite.py), and line tracing is off. Records:
+#     W <ctx>\t<site*4+variant>,...   swaps that would have changed a result in that context
+#     S\t<json site table>
+
+WEAK = os.environ.get("PROFILE_WEAK") == "1"
+_weak = {}
+
+
+def _weak_set():
+    seen = _weak.get(_ctx)
+    if seen is None:
+        seen = _weak[_ctx] = set()
+    return seen
+
+
+def _install_weak_loader():
+    import importlib.machinery
+    import importlib.util
+
+    import weak_rewrite
+
+    prefix = ROOT + "sqlglot" + os.sep
+
+    class WeakLoader(importlib.machinery.SourceFileLoader):
+        def get_code(self, fullname):
+            path = self.get_filename(fullname)
+            if not path.startswith(prefix):
+                return super().get_code(fullname)
+            source = importlib.util.decode_source(self.get_data(path))
+            return weak_rewrite.rewrite(source, path[len(ROOT):], path)
+
+    m = importlib.machinery
+    hook = m.FileFinder.path_hook(
+        (m.ExtensionFileLoader, m.EXTENSION_SUFFIXES),
+        (WeakLoader, m.SOURCE_SUFFIXES),
+        (m.SourcelessFileLoader, m.BYTECODE_SUFFIXES),
+    )
+    sys.path_hooks.insert(0, hook)
+    sys.path_importer_cache.clear()
+    weak_rewrite.install(_weak_set)
+
+
 def pytest_configure(config):
     global _out
     _inline_process_pools()
     _out = gzip.open(OUT, "wt", compresslevel=6)
     mon.use_tool_id(TOOL, "trace_plugin")
     mon.register_callback(TOOL, mon.events.LINE, _on_line)
-    mon.set_events(TOOL, mon.events.LINE)
+    if WEAK:
+        _install_weak_loader()
+    else:
+        mon.set_events(TOOL, mon.events.LINE)
     sys.addaudithook(_audit)
     _enter("<import>")
     _import_everything()
@@ -437,8 +487,14 @@ def pytest_runtest_teardown(item, nextitem):
 
 def pytest_sessionfinish(session, exitstatus):
     mon.set_events(TOOL, 0)
-    for ctx in list(set(_lines) | set(_reads) | set(_missing) | set(_attr_reads)):
+    for ctx in list(set(_lines) | set(_reads) | set(_missing) | set(_attr_reads) | set(_weak)):
         _flush(ctx)
+    if WEAK:
+        import json
+
+        import weak_rewrite
+
+        _out.write("S\t%s\n" % json.dumps(weak_rewrite.SITES))
     for (fid, line), origins in _origins.items():
         _out.write("I %d:%d\t%s\n" % (fid, line, ",".join("%d:%d" % o for o in sorted(origins))))
     for path, fid in _files.items():

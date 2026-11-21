@@ -1,19 +1,25 @@
 #!/usr/bin/env bash
-# Runs the sqlglot suite under the tracing plugins.
-#   profiling/run_profile.sh <profile image> <sqlglot checkout> <output dir>
-# test_max_nodes needs about 1.7 GB on its own, so it runs in a second container.
+# Runs the sqlglot suite under the tracing plugin, twice:
+#   trace  line coverage, file reads, validation and class attribute reads
+#   weak   comparisons and boolean operators evaluated against their swapped forms
+#   profiling/run_profile.sh <profile image> <sqlglot checkout> <output dir> [seed]
+# test_max_nodes needs about 1.7 GB on its own, so each pass runs it in a second container.
 set -euo pipefail
-image=$1 src=$(cd "$2" && pwd) out=$(mkdir -p "$3" && cd "$3" && pwd)
+image=$1 src=$(cd "$2" && pwd) out=$(mkdir -p "$3" && cd "$3" && pwd) seed=${4:-0}
 plugins=$(cd "$(dirname "$0")" && pwd)
 chmod 777 "$out"
 run() {
-  local name=$1 memory=$2; shift 2
+  local name=$1 mode=$2 memory=$3; shift 3
   docker run --rm --cpus 2 --memory "$memory" --memory-swap "$memory" \
     -v "$src:/src:ro" -v "$plugins:/plugins:ro" -v "$out:/out" \
-    -e PYTHONPATH=/src:/plugins -e PROFILE_READS=1 -e PROFILE_OUT="/out/$name.txt.gz" -e OUTCOME_OUT="/out/$name.json" \
+    -e PYTHONPATH=/src:/plugins -e "$mode=1" -e PYTHONHASHSEED="$seed" \
+    -e PROFILE_OUT="/out/$name.txt.gz" -e OUTCOME_OUT="/out/$name.json" \
     -w /src "$image" python -m pytest -q -p trace_plugin -p outcome_plugin -p no:cacheprovider \
-    --timeout 900 "$@" > "$out/$name.log" 2>&1
+    --timeout 1800 "$@" > "$out/$name.log" 2>&1
   tail -1 "$out/$name.log"
 }
-run main 2800m tests --deselect tests/test_parser.py::TestParser::test_max_nodes
-run max_nodes 3500m tests/test_parser.py::TestParser::test_max_nodes
+max_nodes=tests/test_parser.py::TestParser::test_max_nodes
+run trace_main PROFILE_READS 2800m tests --deselect "$max_nodes"
+run trace_max_nodes PROFILE_READS 3500m "$max_nodes"
+run weak_main PROFILE_WEAK 2800m tests --deselect "$max_nodes"
+run weak_max_nodes PROFILE_WEAK 3500m "$max_nodes"

@@ -29,6 +29,7 @@ from source_index import DOC, IMPORT, MIXED, NONE, RUNTIME, index_source  # noqa
 
 NO_TESTS = -1
 GLOBAL = -2
+FRESH_INTERPRETER_TESTS = ("tests/dialects/test_dialect.py::TestDialect::test_lazy_load",)
 FORMAT = 1
 PINNED = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
 SOURCE_DIRS = ("sqlglot/", "tests/", "sqlglotc/")
@@ -48,13 +49,16 @@ def read_profile(paths, meta=None):
         records = []
         with gzip.open(path, "rt") as f:
             for raw in f:
-                kind, rest = raw[0], raw[2:].rstrip("\n")
+                kind, rest = raw[0], raw[2:].rstrip("\n") if raw[1:2] == " " else raw[1:].rstrip("\n")
                 if kind == "F":
                     fid, rel = rest.split("\t", 1)
                     files[int(fid)] = rel
                 else:
                     records.append((kind, rest))
         for kind, rest in records:
+            if kind == "S":
+                meta["sites"] = json.loads(rest.lstrip("\t"))
+                continue
             if kind == "A":
                 owner, _, names = rest.partition("\t")
                 meta["instrumented"].update((owner, n) for n in names.split(",") if n)
@@ -85,6 +89,8 @@ def read_profile(paths, meta=None):
                     entry["missing"].add((cls, arg))
             elif kind == "R" and payload:
                 entry["attrs"].update(payload.split(","))
+            elif kind == "W" and payload:
+                entry.setdefault("weak", set()).update(int(c) for c in payload.split(","))
     return contexts
 
 
@@ -292,6 +298,8 @@ def main():
     ap.add_argument("--src", required=True)
     ap.add_argument("--profile", nargs="+", required=True)
     ap.add_argument("--outcomes", nargs="+", required=True)
+    ap.add_argument("--weak", nargs="*", default=[], help="profiles recorded with PROFILE_WEAK=1")
+    ap.add_argument("--weak-outcomes", nargs="*", default=[], help="outcomes of the weak runs")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     src = os.path.abspath(args.src)
@@ -523,6 +531,7 @@ def main():
             "cattr": cattr,
             "dflt": dflt,
             "checks": set(checks),
+            "units": [x for unit in ix["units"] for x in unit],
             "users": GLOBAL if users == GLOBAL else table.add(users),
             "sha1": digests[rel],
         }
@@ -537,6 +546,48 @@ def main():
                 openers[path] = GLOBAL
             else:
                 openers[path] |= charged
+
+    # ------------------------------------------------------------- weak mutation sites
+    weak_sites = 0
+    if args.weak:
+        wmeta = {}
+        wcontexts = read_profile(args.weak, wmeta)
+        sites = wmeta.get("sites", [])
+        # Tests the weak runs did not cover (or that failed there) keep their plain coverage.
+        weak_ran, weak_failed = read_outcomes(args.weak_outcomes) if args.weak_outcomes else ([], [])
+        unprofiled = 0
+        trusted = set(weak_ran) - set(weak_failed)
+        for t, i in tests.index.items():
+            if t not in trusted:
+                unprofiled |= 1 << i
+        if unprofiled:
+            print("build_map: %d tests have no weak profile; they keep plain coverage" % bin(unprofiled).count("1"), file=sys.stderr)
+        infected = defaultdict(int)
+        for ctx, entry in wcontexts.items():
+            codes = entry.get("weak")
+            if not codes:
+                continue
+            charged = tests.resolve(ctx)
+            for code in codes:
+                if charged == GLOBAL or infected[code] == GLOBAL:
+                    infected[code] = GLOBAL
+                else:
+                    infected[code] |= charged
+        for site, (rel, ln, c0, c1, text, variants) in enumerate(sites):
+            if c0 < 0 or rel not in out_files or not variants:
+                continue
+            usable = []
+            fallback = cov.get((rel, ln), 0) & unprofiled
+            for index, vtext in enumerate(variants):
+                bits = infected.get(site * 4 + index, 0)
+                if bits == GLOBAL:
+                    continue  # it would differ while sqlglot is being imported: no shortcut
+                usable.append((vtext, table.add(bits | fallback)))
+            if usable:
+                out_files[rel].setdefault("weak", {}).setdefault(ln, []).append((c0, c1, text.strip(), usable))
+                weak_sites += 1
+    for info in out_files.values():
+        info.setdefault("weak", {})
 
     scopes = test_module_scopes(src, tests)
 
@@ -575,6 +626,8 @@ def main():
         "files": out_files,
         "reads": {p: (GLOBAL if b == GLOBAL else table.add(b)) for p, b in openers.items()},
         "scopes": {p: table.add(b) for p, b in scopes.items()},
+        # tests that import sqlglot in a fresh interpreter, which the profile cannot see into
+        "fresh": [tests.index[t] for t in FRESH_INTERPRETER_TESTS if t in tests.index],
         "sets": table.sets,
     }
     data = zlib.compress(marshal.dumps(blob), 9)
@@ -582,8 +635,8 @@ def main():
     with open(args.out, "wb") as f:
         f.write(data)
     print(
-        "build_map: %d tests, %d files, %d sets, %d read paths -> %s (%.1f MB)"
-        % (len(tests.ids), len(out_files), len(table.sets), len(openers), args.out, len(data) / 1e6),
+        "build_map: %d tests, %d files, %d sets, %d read paths, %d weak sites -> %s (%.1f MB)"
+        % (len(tests.ids), len(out_files), len(table.sets), len(openers), weak_sites, args.out, len(data) / 1e6),
         file=sys.stderr,
     )
 

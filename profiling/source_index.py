@@ -445,6 +445,27 @@ def _token_flags(source: str, lines: list[str]) -> bytearray:
     return flags
 
 
+def compile_units(tree) -> list[tuple[int, int]]:
+    """Line ranges that compile on their own once dedented: module-level statements, and inside
+    classes each statement of the class body (methods with their decorators). An edit inside
+    one of them can be syntax-checked by compiling just that range."""
+    units = []
+
+    def first_line(stmt):
+        decorators = getattr(stmt, "decorator_list", None) or []
+        return min([stmt.lineno] + [d.lineno for d in decorators])
+
+    def walk(body):
+        for stmt in body:
+            if isinstance(stmt, ast.ClassDef):
+                walk(stmt.body)
+            else:
+                units.append((first_line(stmt), stmt.end_lineno or stmt.lineno))
+
+    walk(tree.body)
+    return sorted(units)
+
+
 def index_source(source: str) -> dict:
     """Everything the selector needs to know about one file, as plain data."""
     ix = _Indexer(source)
@@ -472,4 +493,5 @@ def index_source(source: str) -> dict:
         "runtime_names": {k: sorted(v) for k, v in ix.runtime_names.items()},
         "imports": sorted(ix.imports),
         "pure": sorted(ix.pure_lines),
+        "units": compile_units(tree),
     }

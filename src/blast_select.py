@@ -244,6 +244,70 @@ def changed_columns(old, new):
     return p, len(old) - s, old[p : len(old) - s], new[p : len(new) - s]
 
 
+def _apply(lines, blocks, first, last):
+    """Lines first..last of the pinned file with the given blocks applied."""
+    out = []
+    pos = first
+    for b in sorted(blocks, key=lambda b: b.start):
+        out.extend(lines[pos - 1 : b.start - 1])
+        out.extend(b.new)
+        pos = b.start + len(b.old)
+    out.extend(lines[pos - 1 : last])
+    return out
+
+
+def _dedent(lines):
+    """Strips the first line's indentation from every line; None if a code line sits further
+    left than that (the edit moved code out of its block)."""
+    if not lines:
+        return lines
+    first = lines[0]
+    indent = first[: len(first) - len(first.lstrip())]
+    out = []
+    for line in lines:
+        if line.startswith(indent):
+            out.append(line[len(indent):])
+        elif not line.strip() or line.lstrip().startswith("#"):
+            out.append(line.lstrip())
+        else:
+            return None
+    return out
+
+
+def _compiles(lines, path):
+    if lines is None:
+        return False
+    try:
+        compile("\n".join(lines), path, "exec", dont_inherit=True)
+    except (SyntaxError, ValueError):
+        return False
+    return True
+
+
+def _overlay_finder(overlay, root):
+    """A meta path finder serving patched copies of some modules from ``overlay``."""
+    import importlib.util
+
+    patched = {}
+    for base, _dirs, names in os.walk(overlay):
+        for name in names:
+            full = os.path.join(base, name)
+            rel = os.path.relpath(full, overlay).replace(os.sep, "/")
+            mod = _module_of(rel)
+            locations = [os.path.join(root, os.path.dirname(rel))] if rel.endswith("__init__.py") else None
+            patched[mod] = (full, locations)
+
+    class Overlay:
+        @staticmethod
+        def find_spec(name, path=None, target=None):
+            hit = patched.get(name)
+            if hit is None:
+                return None
+            return importlib.util.spec_from_file_location(name, hit[0], submodule_search_locations=hit[1])
+
+    return Overlay
+
+
 def _module_of(path):
     name = path[:-3].replace("/", ".")
     return name[: -len(".__init__")] if name.endswith(".__init__") else name
@@ -256,6 +320,9 @@ class Selector:
         self.reads = blob["reads"]
         self.scopes = blob["scopes"]
         self.sets = blob["sets"]
+        self.fresh = blob.get("fresh", [])
+        self._warm = False
+        self._baseline = None
         self.sources = sources
         self._lines = {}
 
@@ -264,23 +331,35 @@ class Selector:
         acc = [0, False]
         self.import_check = set()
         self.patched = {}
+        self.changed = {}
         for change in parse_patch(patch_text):
             self.file_change(change, acc)
             if acc[1]:
                 break
-        if self.import_check and not acc[1] and not self.imports_cleanly():
-            log("patched modules no longer import:", sorted(self.import_check))
-            acc[1] = True
+        if self.import_check and not acc[1]:
+            if not self.imports_cleanly():
+                log("patched modules no longer import:", sorted(self.import_check))
+                acc[1] = True
+            for index in self.fresh:
+                acc[0] |= 1 << index
         return acc
 
     def imports_cleanly(self):
         """An edit to an import-time value is charged to the tests that read it, which is only
-        right if every module still imports. Checked in a fresh interpreter over the pinned
-        sources with the patched files laid on top."""
-        if not os.path.isdir(self.sources) or not all(p in self.patched for p in self.import_check):
+        right if every module still imports. The patched modules and their importers are
+        imported again over the pinned sources; a failure is confirmed in a fresh interpreter
+        before it is believed."""
+        if not os.path.isdir(self.sources):
             return True  # nothing to check against; keep the map's answer
+        for path, (info, blocks) in self.changed.items():
+            if self.source_lines(path, info) is None:
+                return True
+            self.patched_text(path, info, blocks)
+        wanted = set()
+        for path in self.import_check:
+            wanted.add(_module_of(path))
+            wanted.update(m for m in self.files[path].get("importers", ()) if not m.endswith("__main__"))
         import shutil
-        import subprocess
         import tempfile
 
         overlay = tempfile.mkdtemp(prefix="blast-")
@@ -290,33 +369,72 @@ class Selector:
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
                 with open(dest, "w", encoding="utf-8") as f:
                     f.write(text)
-            wanted = set()
-            for path in self.import_check:
-                wanted.add(_module_of(path))
-                wanted.update(m for m in self.files[path].get("importers", ()) if not m.endswith("__main__"))
-            done = subprocess.run(
-                [
-                    sys.executable, "-S", "-B", "-c", IMPORT_CHECK, self.sources, overlay,
-                    ",".join(self.baseline()), ",".join(sorted(wanted)),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-            return done.returncode == 0 and not done.stdout.strip()
+            if hasattr(os, "fork") and self.forked_check(overlay, wanted):
+                return True
+            return self.fresh_check(overlay, wanted)
         except Exception as error:  # noqa: BLE001
             log("import check failed to run:", repr(error))
             return False
         finally:
             shutil.rmtree(overlay, ignore_errors=True)
 
+    def forked_check(self, overlay, wanted):
+        """Imports sqlglot once in this process, then re-imports the patched modules (and the
+        modules that import them) in a forked child, which costs far less than a fresh start."""
+        if not self._warm:
+            self._warm = True
+            sys.path.insert(0, self.sources)
+            try:
+                import sqlglot  # noqa: F401
+            except Exception:  # noqa: BLE001
+                return False
+        sys.stdout.flush()
+        sys.stderr.flush()
+        pid = os.fork()
+        if pid == 0:
+            status = 1
+            try:
+                import importlib
+
+                scope = {_module_of(p) for p in self.patched} | wanted
+                for name in list(sys.modules):
+                    if name in scope:
+                        del sys.modules[name]
+                sys.meta_path.insert(0, _overlay_finder(overlay, self.sources))
+                for name in ["sqlglot"] + sorted(wanted):
+                    if name not in self.baseline():
+                        importlib.import_module(name)
+                status = 0
+            except BaseException:  # noqa: BLE001
+                status = 1
+            finally:
+                os._exit(status)
+        _, code = os.waitpid(pid, 0)
+        return os.WIFEXITED(code) and os.WEXITSTATUS(code) == 0
+
+    def fresh_check(self, overlay, wanted):
+        import subprocess
+
+        done = subprocess.run(
+            [
+                sys.executable, "-S", "-B", "-c", IMPORT_CHECK, self.sources, overlay,
+                ",".join(self.baseline()), ",".join(sorted(wanted)),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        return done.returncode == 0 and not done.stdout.strip()
+
     def baseline(self):
         """Modules that already fail to import in this image without any patch."""
-        try:
-            with open(IMPORT_BASELINE) as f:
-                return [m for m in f.read().split(",") if m.strip()]
-        except OSError:
-            return []
+        if self._baseline is None:
+            try:
+                with open(IMPORT_BASELINE) as f:
+                    self._baseline = [m for m in f.read().split(",") if m.strip()]
+            except OSError:
+                self._baseline = []
+        return self._baseline
 
     def charge(self, acc, sid):
         if sid == GLOBAL:
@@ -403,33 +521,71 @@ class Selector:
             return False
         return code_lines(b.old) == code_lines(b.new)
 
+    @staticmethod
+    def weak_match(sites, old, new):
+        """If the edit swaps exactly one profiled operator or constant, the tests that would
+        have seen that swap change a result (from the weak mutation profile)."""
+        for c0, c1, text, variants in sites:
+            if old[c0:c1] != text:
+                continue
+            for vtext, sid in variants:
+                if old[:c0] + vtext + old[c1:] == new:
+                    return sid
+                if vtext in ("==", "!=") and old[:c0].rstrip() + " " + vtext + " " + old[c1:].lstrip() == new:
+                    return sid
+        return None
+
     def compiles(self, path, info, blocks):
-        """Compile the patched file; an edit that breaks the syntax breaks every importer."""
+        """Syntax check of the patched file; an edit that breaks the syntax breaks every
+        importer. Each edit is checked by compiling just the unit around it (a module-level
+        statement or one statement of a class body); anything unusual compiles the whole file."""
         lines = self.source_lines(path, info)
         if lines is None:
             return True  # no pinned source to check against; keep the map's answer
-        out = []
-        pos = 1
-        for b in sorted(blocks, key=lambda b: b.start):
-            if b.start < pos or b.start - 1 > len(lines):
-                return False
-            out.extend(lines[pos - 1 : b.start - 1])
+        for b in blocks:
             if lines[b.start - 1 : b.start - 1 + len(b.old)] != b.old:
                 return False  # the patch does not apply to the pinned file
-            out.extend(b.new)
-            pos = b.start + len(b.old)
-        out.extend(lines[pos - 1 :])
-        text = "\n".join(out)
-        try:
-            compile(text, path, "exec", dont_inherit=True)
-        except (SyntaxError, ValueError):
-            return False
-        self.patched[path] = text
-        return True
+        units = self.units_for(info, blocks)
+        if units is not None:
+            ok = True
+            for (u0, u1), inner in units.items():
+                if not _compiles(_dedent(_apply(lines, inner, u0, u1)), path):
+                    ok = False
+                    break
+            if ok:
+                return True
+        return _compiles(self.patched_text(path, info, blocks).split("\n"), path)
+
+    @staticmethod
+    def units_for(info, blocks):
+        """{(first, last line): blocks inside it} or None if some edit is not inside one unit."""
+        import bisect
+
+        flat = info.get("units") or []
+        starts = flat[0::2]
+        ends = flat[1::2]
+        out = {}
+        for b in blocks:
+            lo = b.start if b.old else b.start - 1
+            hi = b.start + len(b.old) - 1 if b.old else b.start
+            i = bisect.bisect_right(starts, lo) - 1
+            if i < 0 or not (starts[i] <= lo and hi <= ends[i]):
+                return None
+            out.setdefault((starts[i], ends[i]), []).append(b)
+        return out
+
+    def patched_text(self, path, info, blocks):
+        text = self.patched.get(path)
+        if text is None:
+            lines = self.source_lines(path, info)
+            text = "\n".join(_apply(lines, blocks, 1, len(lines)))
+            self.patched[path] = text
+        return text
 
     def python_change(self, path, info, blocks, acc):
         kind = info["kind"]
         n = len(kind)
+        self.changed[path] = (info, blocks)
         live = [b for b in blocks if not self.inert(info, b)]
         if not live:
             return
@@ -448,6 +604,11 @@ class Selector:
                 if not 1 <= ln <= n:
                     continue
                 k = kind[ln - 1]
+                if k in (RUNTIME, MIXED) and pairs and len(b.old) == 1 and ln in info["weak"]:
+                    sid = self.weak_match(info["weak"][ln], b.old[0], b.new[0])
+                    if sid is not None:
+                        self.charge(acc, sid)
+                        continue
                 if k == RUNTIME:
                     self.charge(acc, sets.get(ln, NO_TESTS))
                     if ln in info["checks"]:
