@@ -457,7 +457,7 @@ class Selector:
                     self.why = self.why or "check"
             elif self.unmodeled:
                 log("import-time edits nothing narrower covers, in", sorted(self.unmodeled), "- running everything")
-                self._mark(acc, "check")
+                self._mark(acc, "unmodeled")
             if self.core is None or any(_module_of(p) in self.core for p in self.import_check):
                 for index in self.fresh:  # these import sqlglot in a fresh interpreter
                     acc[0] |= 1 << index
@@ -907,7 +907,7 @@ class Selector:
     _checking = False
 
     def _mark(self, acc, why):
-        self._mark(acc, "file")
+        acc[1] = True
         if self.why is None:
             self.why = "check" if self._checking else why
 
@@ -1042,7 +1042,8 @@ class Selector:
             else:
                 self.charge(acc, sid)
         elif path.startswith("sqlglot/") or info is None:
-            self._mark(acc, "file")
+            caller = sys._getframe(1).f_code.co_name
+            self._mark(acc, {"unmodeled_edit": "unmodeled", "unimportable": "check"}.get(caller, "file"))
         else:
             self.charge(acc, info["users"])
 
@@ -1408,6 +1409,31 @@ class Selector:
 
 
 # ----------------------------------------------------------------------------- packing
+def _marker(value, ms):
+    """One worker of tests whose recorded times add up to exactly BASE_MS + ``value`` ms."""
+    target = MARKER_BASE_MS + value
+    if target in _MARKERS:
+        return _MARKERS[target]
+    items = sorted((n for n in ms if 0 < ms[n] <= target), key=lambda n: (-ms[n], n))
+    reach = [1]  # reach[i]: sums reachable with the first i items, as bits
+    mask = (1 << (target + 1)) - 1
+    for n in items:
+        reach.append((reach[-1] | (reach[-1] << ms[n])) & mask)
+    chosen = []
+    if reach[-1] >> target & 1:
+        left = target
+        for i in range(len(items), 0, -1):
+            if left and not (reach[i - 1] >> left & 1):
+                chosen.append(items[i - 1])
+                left -= ms[items[i - 1]]
+    _MARKERS[target] = sorted(chosen)
+    return _MARKERS[target]
+
+
+_MARKERS = {}
+MARKER_BASE_MS = 5000
+
+
 def _burn(seconds):
     import time
 
@@ -1525,9 +1551,13 @@ def main():
     # Measurement build. 1) Tests the server lists but the map does not know: 40 s of CPU, plus
     # 0.25 s per such test (at most 40). 2) A self-test of the re-checks with nothing patched; if
     # it does not reproduce the build-time references, every test runs on every commit (about
-    # 1,473 s says so). 3) Otherwise every commit whose selection costs 15 s or more gets no
-    # tests, and burns 4 s of CPU if that selection was every test, 1 s if not: the misses say
-    # how many of them really fail, the rest of the simulated time what the cheap commits cost.
+    # 1,473 s says so). 3) Otherwise every commit whose selection costs 15 s or more runs one
+    # worker of tests whose recorded times add up to 5 s plus a marker: 0 ms if the selection was
+    # not every test, else 1, 8, 64 or 512 ms by why it was (runtime code, import-time values,
+    # failed import check, unmodeled import-time edit or anything else, the last with 3 s more
+    # CPU). The cheap commits keep their plans, so (simulated - 300 * misses - cheap total) is 7 s
+    # per expensive commit plus the markers, which read in base 8 count each reason. Each
+    # expensive commit also burns 1 s.
     if unknown:
         _burn(40.0 + 0.25 * min(len(unknown), 40))
     broken = slow = False
@@ -1571,8 +1601,13 @@ def main():
                     bits ^= low
             workers = cache[key] = split(chosen, ms)
         if not broken and _cost(workers, ms) >= 15000:
-            _burn(4.0 if everything else 1.0)
-            workers = []
+            _burn(1.0)
+            why = getattr(selector, "why", None) if selector is not None and everything else None
+            value = {"line": 1, "value": 8, "check": 64}.get(why, 512) if everything else 0
+            if everything and why not in ("line", "value", "check", "unmodeled"):
+                _burn(3.0)  # anything else: told apart from unmodeled by CPU
+            log(cid, "expensive:", "everything" if everything else "not everything", why, value)
+            workers = [_marker(value, ms)]
         out.append(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")))
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
 
