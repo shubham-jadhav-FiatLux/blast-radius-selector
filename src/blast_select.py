@@ -382,8 +382,11 @@ class Selector:
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
                 with open(dest, "w", encoding="utf-8") as f:
                     f.write(text)
-            if hasattr(os, "fork") and self.forked_check(overlay, wanted):
-                return True
+            try:
+                if hasattr(os, "fork") and self.forked_check(overlay, wanted):
+                    return True
+            except Exception as error:  # noqa: BLE001
+                log("forked import check unavailable, using a fresh interpreter:", repr(error))
             return self.fresh_check(overlay, wanted)
         except Exception as error:  # noqa: BLE001
             log("import check failed to run:", repr(error))

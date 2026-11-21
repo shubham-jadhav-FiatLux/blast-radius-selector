@@ -29,7 +29,9 @@ labelled its commits in (`profiling/`):
    edits. Every comparison and condition inside a sqlglot function is rewritten so that it
    evaluates the swapped form next to the real one: `a <= b` next to `a < b`, `a == b` next to
    `a is b`, `n + 1` and `n - 1` next to a constant `n`, and `x or y` next to `x and y` where
-   only the truth value is used. Swaps that always change the result (`==` and `!=`, `in` and
+   only the truth value is used. For a chain like `a and b and c`, swapping any one operator
+   leaves the result alone only when every operand is truthy, which is what each operand
+   records; conditions split across lines are matched on the line holding the operator. Swaps that always change the result (`==` and `!=`, `in` and
    `not in`, `<` and `>=`, dropping a `not`) only record whether the expression was evaluated
    at all, because `a and b == c` can stop before it. The pass records, per test, which swaps would have
    produced a different result. It runs under several hash seeds, and the runs are merged by

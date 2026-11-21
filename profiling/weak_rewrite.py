@@ -100,7 +100,9 @@ class _Rewriter(ast.NodeTransformer):
 
     def _op_columns(self, left, right, text):
         if left.end_lineno != right.lineno:
-            return None
+            if " " in text:
+                return None
+            return self._token_between(left, right, text)
         line = self.lines[left.end_lineno - 1]
         between = line[left.end_col_offset : right.col_offset]
         if text in ("is", "is not", "in", "not in"):
@@ -174,25 +176,55 @@ class _Rewriter(ast.NodeTransformer):
         call = ast.Call(func=ast.Name(id="__weak_not__", ctx=ast.Load()), args=[ast.Constant(site), node.operand], keywords=[])
         return ast.copy_location(call, node)
 
+    def _token_between(self, left, right, word):
+        """(line, col0, col1) of ``word`` between two operands, which may sit on different
+        lines (a condition split across lines puts the operator at the start of a line).
+        None unless the gap holds exactly that word, brackets and comments aside."""
+        pieces = []
+        for ln in range(left.end_lineno, right.lineno + 1):
+            text = self.lines[ln - 1]
+            c0 = left.end_col_offset if ln == left.end_lineno else 0
+            c1 = right.col_offset if ln == right.lineno else len(text)
+            chunk = text[c0:c1]
+            if "#" in chunk:
+                chunk = chunk[: chunk.index("#")]
+            pieces.append((ln, c0, chunk))
+        found = None
+        for ln, c0, chunk in pieces:
+            stripped = chunk.strip().strip("()").strip()
+            if not stripped:
+                continue
+            if stripped != word or found is not None:
+                return None
+            found = (ln, c0 + chunk.index(word), c0 + chunk.index(word) + len(word))
+        return found
+
     def visit_BoolOp(self, node):
+        """Conditions: in ``a and b and c`` swapping any one ``and`` for ``or`` changes the
+        truth value unless every operand is truthy (and dually for ``or``), so each operand
+        records a difference when it comes out the other way, or when it short-circuits."""
         self.generic_visit(node)
-        if self.depth == 0 or len(node.values) != 2 or id(node) not in self.bool_nodes:
+        if self.depth == 0 or id(node) not in self.bool_nodes:
             return node
-        a, b = node.values
-        if a.end_lineno != b.lineno:
-            return node
-        line = self.lines[a.end_lineno - 1]
-        between = line[a.end_col_offset : b.col_offset]
         word = "and" if isinstance(node.op, ast.And) else "or"
-        if between.strip() != word:
-            return node
-        c0 = a.end_col_offset + between.index(word)
-        site = len(SITES)
-        SITES.append((self.rel, a.end_lineno, c0, c0 + len(word), word, ["or" if word == "and" else "and"]))
-        _DETAIL.append((True, None, word))
-        left = ast.Call(func=ast.Name(id="__weak_left__", ctx=ast.Load()), args=[ast.Constant(site), a], keywords=[])
-        right = ast.Call(func=ast.Name(id="__weak_right__", ctx=ast.Load()), args=[ast.Constant(site), b], keywords=[])
-        node.values = [ast.copy_location(left, a), ast.copy_location(right, b)]
+        sites = []
+        for a, b in zip(node.values, node.values[1:]):
+            where = self._token_between(a, b, word)
+            if where is None:
+                return node
+            ln, c0, c1 = where
+            sites.append(len(SITES))
+            SITES.append((self.rel, ln, c0, c1, word, ["or" if word == "and" else "and"]))
+            _DETAIL.append((True, None, word))
+        codes = tuple(site * 4 for site in sites)
+        node.values = [
+            ast.copy_location(
+                ast.Call(func=ast.Name(id="__weak_bool__", ctx=ast.Load()),
+                         args=[ast.Constant(word == "or"), ast.Constant(codes), value], keywords=[]),
+                value,
+            )
+            for value in node.values
+        ]
         return node
 
 
@@ -259,18 +291,12 @@ def install(current):
             raise result
         return result
 
-    def weak_left(site, value):
-        # "a and b" -> "a or b": differs whenever "a" is falsy (b is never seen) or "b" is.
-        # "a or b" -> "a and b": differs whenever "a" is truthy (b is never seen) or "b" is.
-        word = _DETAIL[site][2]
-        if bool(value) is (word == "or"):
-            current().add(site * 4)
-        return value
-
-    def weak_right(site, value):
-        word = _DETAIL[site][2]
-        if bool(value) is (word == "or"):
-            current().add(site * 4)
+    def weak_bool(is_or, codes, value):
+        # An "and" chain keeps its truth value under a swap only if every operand is truthy;
+        # an "or" chain only if every operand is falsy. Any operand that comes out the other
+        # way (which also ends the evaluation) means the swap can change the result.
+        if bool(value) is is_or:
+            current().update(codes)
         return value
 
     def weak_not(site, value):
@@ -280,5 +306,4 @@ def install(current):
 
     builtins.__weak_cmp__ = weak_cmp
     builtins.__weak_not__ = weak_not
-    builtins.__weak_left__ = weak_left
-    builtins.__weak_right__ = weak_right
+    builtins.__weak_bool__ = weak_bool

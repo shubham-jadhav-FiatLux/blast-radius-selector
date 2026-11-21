@@ -19,9 +19,11 @@ KEEP = ("sqlglot/", "tests/", "sqlglotc/")
 
 def download(commit):
     url = "https://codeload.github.com/tobymao/sqlglot/tar.gz/%s" % commit
-    for attempt in range(4):
+    # At most about three minutes in all: the build has ten, and a missing archive only costs
+    # the compile and import checks, never the build.
+    for attempt in range(3):
         try:
-            with urllib.request.urlopen(url, timeout=120) as response:
+            with urllib.request.urlopen(url, timeout=60) as response:
                 return response.read()
         except Exception as error:  # noqa: BLE001
             print("fetch_sources: attempt %d failed: %r" % (attempt + 1, error), file=sys.stderr)
