@@ -23,7 +23,9 @@ labelled its commits in (`profiling/`):
    - which expression arguments were missing whenever a node was validated;
    - which class attributes it reads, keyed by the class that defines them. Every data
      attribute of every sqlglot class is swapped for a descriptor that returns the same object
-     and notes the read.
+     and notes the read. Dict attributes are served as copies that also note which keys are
+     looked up; any use that can touch every key (iteration, `items()`, copies, `**` spreads,
+     comparisons) counts as reading them all.
 
    A second pass (`weak_rewrite.py`) observes the "changes the state" step for the most common
    edits. Every comparison and condition inside a sqlglot function is rewritten so that it
@@ -71,6 +73,7 @@ edited block:
 | any other edit inside a function body | every test that ran any line of the enclosing statement (with `and`/`or` short-circuiting, a test can depend on a statement without running the edited line), plus the readers of anything that code computed while sqlglot was being imported |
 | inside a lambda that an import-time table holds | the tests that called it |
 | `arg_types` flag flipped | tests that validated a node of an affected class while that argument was missing (`arg_types` values only feed `required_args`); affected classes are the class itself, its subclasses, and classes splicing in its dict |
+| the value of one entry of a class-level dict | tests that looked up that key or used the whole dict, on the class and on dicts spreading it; tables built only from its keys (`SHOW_TRIE` from `SHOW_PARSERS`, `"x" in NUMERIC_ESCAPES` in a hook) are unaffected |
 | other class attribute or module constant (including whole entries added to or removed from a table) | tests that read it, or anything derived from it, on the defining class, its subclasses, or the dialects built from them; `{**Parser.FUNCTIONS}` resolves to `Parser`, not to whichever parser happens to be nearby |
 | default value of a function argument | tests that ran the function |
 | module level code in `tests/` | tests in that module and in every module importing it |
@@ -88,7 +91,7 @@ to 8, followed by a little local search, minimising the busiest worker plus 2 s 
 
 ## Results on the sample
 
-On the kit's 30 sample commits: **111.1 s simulated, 0 misses**, using well under 1 s of CPU
+On the kit's 30 sample commits: **102.1 s simulated, 0 misses**, using well under 1 s of CPU
 for the whole batch. For comparison, running everything costs 1,104 s, and an oracle that knows the
 failing tests costs 94.4 s.
 

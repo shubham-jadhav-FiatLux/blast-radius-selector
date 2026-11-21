@@ -32,4 +32,4 @@ OUTCOMES ?= $(OUT)/profile/trace_main.json $(OUT)/profile/trace_max_nodes.json
 map:
 	docker run --rm --user $$(id -u):$$(id -g) -v $(abspath $(SQLGLOT)):/src:ro -v $(CURDIR):/repo -w /repo $(PROFILE_IMAGE) \
 		python profiling/build_map.py --src /src --out data/map.bin \
-		--profile $(PROFILES) --weak $(WEAK) --outcomes $(OUTCOMES)
+		--profile $(PROFILES) --keys $(PROFILES) --weak $(WEAK) --outcomes $(OUTCOMES)

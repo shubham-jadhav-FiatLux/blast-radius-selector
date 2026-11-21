@@ -728,6 +728,10 @@ class Selector:
                     target = ASSIGN_TARGET_RE.match(b.old[i])
                     sid, check = info["cattr"][ln]
                     if target is None or cols[0] >= target.end():
+                        a, z = cols[0], max(cols[1], cols[0] + 1)
+                        entry = [e for e in info.get("kattr", {}).get(ln, ()) if e[0] <= a and z <= e[1]]
+                        if entry:
+                            sid = entry[0][2]  # the value of one dict entry: whoever looked up its key
                         self.charge(acc, sid)  # the value changed
                         if check:
                             self.import_check.add(path)

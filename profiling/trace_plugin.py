@@ -11,6 +11,7 @@ It writes one gzip text file (``PROFILE_OUT``) with these records:
     A <class>\t<attr>,...         attributes that were instrumented
     K <class>\t<mro>\t<parts>     class family: MRO and a dialect's component classes
     I <fid>:<line>\t<fid>:<line>,...  import-time statements a function line ran on behalf of
+    Y <ctx>\t[[<class>:<attr>, <key>], ...]  dict keys looked up (PROFILE_KEYS=1; "*" = all)
 
 Contexts:
 
@@ -143,6 +144,11 @@ def _flush(ctx):
     attrs = _attr_reads.pop(ctx, None)
     if attrs:
         _out.write("R %s\t%s\n" % (ctx, ",".join(sorted(attrs))))
+    keyed = _key_reads.pop(ctx, None)
+    if keyed:
+        import json
+
+        _out.write("Y %s\t%s\n" % (ctx, json.dumps(sorted({(tag, _key_text(k)) for tag, k in keyed}))))
     weak = _weak.pop(ctx, None)
     if weak:
         _out.write("W %s\t%s\n" % (ctx, ",".join(map(str, sorted(weak)))))
@@ -276,12 +282,136 @@ class _RecordedBinding(_Recorded):
         return self.value.__get__(obj, objtype)
 
 
+# With PROFILE_KEYS=1 (and PROFILE_READS=1), a class attribute holding a plain dict is served
+# as a copy that also notes which keys each context looks up. Any use that may touch every key
+# (iteration, items(), copies, ** spreads, comparisons, repr) is noted as "*".
+KEYS = os.environ.get("PROFILE_KEYS") == "1"
+_key_reads = {}
+
+
+def _note_key(tag, key):
+    seen = _key_reads.get(_ctx)
+    if seen is None:
+        seen = _key_reads[_ctx] = set()
+    try:
+        seen.add((tag, key))
+    except TypeError:  # unhashable key: the lookup itself would have failed
+        seen.add((tag, _WHOLE))
+
+
+_WHOLE = object()
+
+
+class _KeyRecordingDict(dict):
+    __slots__ = ("_tag",)
+
+    def __getitem__(self, key):
+        _note_key(self._tag, key)
+        return dict.__getitem__(self, key)
+
+    def get(self, key, default=None):
+        _note_key(self._tag, key)
+        return dict.get(self, key, default)
+
+    def __contains__(self, key):
+        _note_key(self._tag, key)
+        return dict.__contains__(self, key)
+
+    def pop(self, key, *default):
+        _note_key(self._tag, key)
+        return dict.pop(self, key, *default)
+
+    def setdefault(self, key, default=None):
+        _note_key(self._tag, key)
+        return dict.setdefault(self, key, default)
+
+    def _all(self):
+        _note_key(self._tag, _WHOLE)
+
+    def __iter__(self):
+        self._all()
+        return dict.__iter__(self)
+
+    def __reversed__(self):
+        self._all()
+        return dict.__reversed__(self)
+
+    def keys(self):
+        self._all()
+        return dict.keys(self)
+
+    def values(self):
+        self._all()
+        return dict.values(self)
+
+    def items(self):
+        self._all()
+        return dict.items(self)
+
+    def __len__(self):
+        self._all()
+        return dict.__len__(self)
+
+    def copy(self):
+        self._all()
+        return dict.copy(self)
+
+    def __eq__(self, other):
+        self._all()
+        return dict.__eq__(self, other)
+
+    def __ne__(self, other):
+        self._all()
+        return dict.__ne__(self, other)
+
+    def __or__(self, other):
+        self._all()
+        return dict.__or__(self, other)
+
+    def __ror__(self, other):
+        self._all()
+        return dict.__ror__(self, other)
+
+    def __repr__(self):
+        self._all()
+        return dict.__repr__(self)
+
+    def __reduce_ex__(self, protocol):
+        self._all()
+        return (dict, (dict(dict.items(self)),))
+
+    __hash__ = None
+
+
+def _key_text(key):
+    """A stable spelling of a dict key, shared with the map builder."""
+    import enum
+
+    if key is _WHOLE:
+        return "*"
+    if isinstance(key, bool) or key is None:
+        return "k:%r" % (key,)
+    if isinstance(key, (str, int, float)):
+        return "%s:%r" % (type(key).__name__, key)
+    if isinstance(key, enum.Enum):
+        return "e:%s.%s.%s" % (type(key).__module__, type(key).__qualname__, key.name)
+    if isinstance(key, type):
+        return "c:%s.%s" % (key.__module__, key.__qualname__)
+    if isinstance(key, tuple):
+        return "t:(%s)" % ",".join(_key_text(k) for k in key)
+    return "*"
+
+
 def _recorder_for(cls, name, value, tag):
     import types
 
     kind = type(value)
     if isinstance(value, type):
         return None
+    if KEYS and kind is dict:
+        served = _KeyRecordingDict(value)
+        served._tag = tag
+        return _Recorded(tag, served)
     if not hasattr(kind, "__get__"):
         return _Recorded(tag, value)
     if hasattr(kind, "__set__") or hasattr(kind, "__delete__"):
@@ -487,7 +617,7 @@ def pytest_runtest_teardown(item, nextitem):
 
 def pytest_sessionfinish(session, exitstatus):
     mon.set_events(TOOL, 0)
-    for ctx in list(set(_lines) | set(_reads) | set(_missing) | set(_attr_reads) | set(_weak)):
+    for ctx in list(set(_lines) | set(_reads) | set(_missing) | set(_attr_reads) | set(_weak) | set(_key_reads)):
         _flush(ctx)
     if WEAK:
         import json

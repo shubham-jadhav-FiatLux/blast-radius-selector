@@ -91,6 +91,8 @@ def read_profile(paths, meta=None):
                 entry["attrs"].update(payload.split(","))
             elif kind == "W" and payload:
                 entry.setdefault("weak", set()).update(int(c) for c in payload.split(","))
+            elif kind == "Y" and payload:
+                entry.setdefault("keys", set()).update((tag, k) for tag, k in json.loads(payload))
     return contexts
 
 
@@ -313,6 +315,7 @@ def main():
     ap.add_argument("--outcomes", nargs="+", required=True)
     ap.add_argument("--weak", nargs="*", default=[], help="profiles recorded with PROFILE_WEAK=1")
     ap.add_argument("--weak-outcomes", nargs="*", default=[], help="outcomes of the weak runs")
+    ap.add_argument("--keys", nargs="*", default=[], help="profiles recorded with PROFILE_KEYS=1 (also in --profile)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     src = os.path.abspath(args.src)
@@ -470,6 +473,48 @@ def main():
         return name_cache[name]
 
     effects = ImportEffects(files, meta["families"], meta["instrumented"], attr_reads, attr_global, name_cov)
+
+    # Dict keys looked up per test (PROFILE_KEYS=1). A test that read a dict attribute but left
+    # no key record used it in a way the profile cannot see and is charged for every key.
+    key_bits = defaultdict(int)
+    key_tags = set()
+    for ctx, entry in contexts.items():
+        found = entry.get("keys")
+        if not found:
+            continue
+        charged = tests.resolve(ctx)
+        for tag, k in found:
+            key_tags.add(tag)
+            if charged == GLOBAL or key_bits[(tag, k)] == GLOBAL:
+                key_bits[(tag, k)] = GLOBAL
+            else:
+                key_bits[(tag, k)] |= charged
+    # Readers seen by the keyed runs themselves: one of those with no key record never looked
+    # inside the dict (every way in is recorded). Readers only seen in other runs are charged.
+    keyrun_reads = defaultdict(int)
+    if args.keys:
+        for ctx, entry in read_profile(args.keys, {}).items():
+            charged = tests.resolve(ctx)
+            for tag in entry["attrs"]:
+                if charged == GLOBAL or keyrun_reads[tag] == GLOBAL:
+                    keyrun_reads[tag] = GLOBAL
+                else:
+                    keyrun_reads[tag] |= charged
+
+    def keyed(tag, k):
+        if tag not in key_tags and tag not in keyrun_reads:
+            return attr_reads.get(tag, 0)  # never profiled by key: charge every reader
+        parts = [key_bits.get((tag, k), 0), key_bits.get((tag, "*"), 0), keyrun_reads.get(tag, 0)]
+        if GLOBAL in parts:
+            return GLOBAL
+        unseen = attr_reads.get(tag, 0) & ~parts[2]
+        return parts[0] | parts[1] | unseen
+
+    displays = set()
+    for rel, ix in files.items():
+        for qualname, attr in ix.get("dict_displays", ()):
+            if qualname:
+                displays.add(("%s.%s" % (module_name(rel), qualname), attr))
     if not meta["families"]:
         print("build_map: profile has no class records; import-time edits will run everything", file=sys.stderr)
 
@@ -510,7 +555,21 @@ def main():
             argt[ln] = GLOBAL if glob else table.add(bits)
 
         cattr = {}
+        kattr = {}
         dflt = {}
+        if rel.startswith("sqlglot/") and key_tags:
+            for ln, entries in ix.get("dict_entries", {}).items():
+                out = []
+                for qualname, attr, source, c0, c1 in entries:
+                    if not qualname:
+                        continue  # module-level dicts are not profiled by key
+                    k = effects.resolve_key(rel, qualname, source)
+                    if k is None:
+                        continue
+                    owner = "%s.%s" % (module_name(rel), qualname)
+                    out.append((c0, c1, table.add(effects.tests_for_key(owner, attr, k, keyed, displays))))
+                if out:
+                    kattr[ln] = out
         if rel.startswith("sqlglot/") and meta["families"]:
             pure = set(ix["pure"])
             for ln, entries in ix["classattr"].items():
@@ -542,6 +601,7 @@ def main():
             "cols": ix["runtime_cols"],
             "argt": argt,
             "cattr": cattr,
+            "kattr": kattr,
             "dflt": dflt,
             "checks": set(checks),
             "units": [x for unit in ix["units"] for x in unit],

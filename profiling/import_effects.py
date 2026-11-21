@@ -27,6 +27,23 @@ ANY = "*"
 MODULE = "<global>"
 
 
+def key_text(key):
+    """A stable spelling of a dict key. Must match trace_plugin._key_text."""
+    import enum
+
+    if isinstance(key, bool) or key is None:
+        return "k:%r" % (key,)
+    if isinstance(key, (str, int, float)):
+        return "%s:%r" % (type(key).__name__, key)
+    if isinstance(key, enum.Enum):
+        return "e:%s.%s.%s" % (type(key).__module__, type(key).__qualname__, key.name)
+    if isinstance(key, type):
+        return "c:%s.%s" % (key.__module__, key.__qualname__)
+    if isinstance(key, tuple):
+        return "t:(%s)" % ",".join(key_text(k) for k in key)
+    return None
+
+
 def module_name(rel):
     name = rel[:-3].replace("/", ".")
     return name[: -len(".__init__")] if name.endswith(".__init__") else name
@@ -54,10 +71,11 @@ class ImportEffects:
             if not rel.startswith("sqlglot/"):
                 continue
             mod = sys.modules.get(module_name(rel))
-            for scope, qualname, targets, bare, refs in ix["derivations"]:
+            for scope, qualname, targets, bare, refs, *rest in ix["derivations"]:
+                keyonly = frozenset(rest[0]) if rest else frozenset()
                 owner = "%s.%s" % (module_name(rel), qualname) if qualname else MODULE
                 if scope == "hook":
-                    entry = (scope, owner, targets, (), frozenset(bare))
+                    entry = (scope, owner, targets, (), frozenset(bare), keyonly)
                     names = set(bare)
                 else:
                     resolved = set()
@@ -67,7 +85,7 @@ class ImportEffects:
                             resolved.add((owner, name))
                     for receiver, attr in refs:
                         resolved |= self.resolve(mod, owner if scope == "class" else None, receiver, attr)
-                    entry = (scope, owner, targets, frozenset(resolved), frozenset())
+                    entry = (scope, owner, targets, frozenset(resolved), frozenset(), keyonly)
                     names = {n for _o, n in resolved}
                 index = len(self.derivations)
                 self.derivations.append(entry)
@@ -155,7 +173,10 @@ class ImportEffects:
         return fam
 
     # ------------------------------------------------------------------ closure
-    def affected(self, owner, attr):
+    def affected(self, owner, attr, values_only=False):
+        """Every (owner, attribute) whose value an edit to ``owner.attr`` can change. With
+        ``values_only`` the edit changes only the value of an existing dict entry, so code that
+        uses ``attr`` purely by key (membership tests, iteration over keys) is not affected."""
         start = (owner, attr)
         done = {start}
         names = {attr}
@@ -163,7 +184,9 @@ class ImportEffects:
         while frontier:
             o, n = frontier.pop()
             for index in self.by_name.get(n, ()):
-                scope, d_owner, targets, reads, hook_names = self.derivations[index]
+                scope, d_owner, targets, reads, hook_names, keyonly = self.derivations[index]
+                if values_only and (o, n) == start and n in keyonly:
+                    continue
                 new = []
                 if scope == "hook":
                     members = self.hook_family(d_owner) if o in (MODULE, ANY) else self.family(o)
@@ -180,6 +203,56 @@ class ImportEffects:
                         names.add(pair[1])
                         frontier.append(pair)
         return done
+
+    def resolve_key(self, rel, qualname, source):
+        """The runtime spelling of a dict entry's key written as ``source`` in that class."""
+        import ast as _ast
+
+        try:
+            return key_text(_ast.literal_eval(source))
+        except (ValueError, SyntaxError):
+            pass
+        mod = sys.modules.get(module_name(rel))
+        if mod is None:
+            return None
+        parts = source.split(".")
+        obj = None
+        cls = self._class("%s.%s" % (module_name(rel), qualname)) if qualname else None
+        if cls is not None and parts[0] in vars(cls):
+            obj = vars(cls)[parts[0]]
+        if obj is None:
+            obj = vars(mod).get(parts[0], getattr(builtins, parts[0], None))
+        for part in parts[1:]:
+            obj = getattr(obj, part, None)
+        return key_text(obj) if obj is not None else None
+
+    def tests_for_key(self, owner, attr, key, keyed, displays):
+        """Like tests_for, for an edit to the value of one entry of a dict attribute: the dict
+        itself and copies made by spreading it into another dict display are charged by key,
+        everything derived in any other way by attribute."""
+        if owner not in self.families or (owner, attr) not in self.instrumented:
+            return GLOBAL
+        bits = 0
+        for o, n in self.affected(owner, attr, values_only=True):
+            if o == MODULE:
+                cov = self.name_cov(n)
+                if cov == GLOBAL:
+                    return GLOBAL
+                bits |= cov
+                continue
+            if o == ANY:
+                return GLOBAL
+            tag = "%s:%s" % (o, n)
+            if tag in self.global_reads:
+                return GLOBAL
+            if n == attr and (o == owner or (o, n) in displays):
+                got = keyed(tag, key)
+            else:
+                got = self.reads.get(tag, 0)
+            if got == GLOBAL:
+                return GLOBAL
+            bits |= got
+        return bits
 
     def tests_for(self, owner, attr):
         """Bitset of tests that can observe a change to ``owner.attr``, or GLOBAL."""

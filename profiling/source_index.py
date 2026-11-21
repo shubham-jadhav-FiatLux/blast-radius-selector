@@ -81,6 +81,9 @@ class _Indexer:
         self.runtime_names: dict[str, set[int]] = {}
         self.hook_owner = ""
         self.pure_lines: set[int] = set()
+        # line -> [(class qualname, attribute, key source, value col0, value col1)]
+        self.dict_entries: dict[int, list[tuple]] = {}
+        self.dict_displays: list[tuple[str, str]] = []
         # line -> column ranges of annotations that are never evaluated
         self.annotations: dict[int, list[tuple[int, int]]] = {}
         self.postponed = False
@@ -242,10 +245,28 @@ class _Indexer:
             self.argtypes_classes[qualname] = info
 
     # ------------------------------------------------------------------ class attributes
+    def note_dict_entries(self, stmt, qualname, names):
+        """Entries of a dict display assigned at class or module level, so the selector can
+        charge an edit to one entry's value to the tests that looked up that key."""
+        value = getattr(stmt, "value", None)
+        if not isinstance(value, ast.Dict) or len(names) != 1:
+            return
+        self.dict_displays.append((qualname, names[0]))
+        for key, val in zip(value.keys, value.values):
+            if key is None or key.lineno != val.end_lineno or key.lineno != key.end_lineno:
+                continue
+            if not (isinstance(key, ast.Constant) or _dotted(key)):
+                continue
+            self.dict_entries.setdefault(key.lineno, []).append(
+                (qualname, names[0], ast.unparse(key), val.col_offset, val.end_col_offset)
+            )
+
     def note_classattr(self, stmt, qualname):
         names = _target_names(stmt)
         if not names or not isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
             return
+        if not isinstance(stmt, ast.AugAssign):
+            self.note_dict_entries(stmt, qualname, names)
         pure = isinstance(stmt, (ast.Assign, ast.AnnAssign)) and stmt.value is not None and _is_pure(stmt.value)
         for ln in range(stmt.lineno, (stmt.end_lineno or stmt.lineno) + 1):
             for name in names:
@@ -267,7 +288,10 @@ class _Indexer:
         if isinstance(stmt, ast.AugAssign):
             bare |= set(targets)
         if bare or refs:
-            self.derivations.append((scope, qualname, tuple(sorted(targets)), tuple(sorted(bare)), tuple(sorted(refs))))
+            keyonly = tuple(sorted(_key_only_names(value))) if value is not None else ()
+            self.derivations.append(
+                (scope, qualname, tuple(sorted(targets)), tuple(sorted(bare)), tuple(sorted(refs)), keyonly)
+            )
 
     def note_hook(self, func):
         """Class-creation hooks (__init_subclass__, metaclass __new__/__init__) derive attributes,
@@ -325,6 +349,7 @@ class _Indexer:
                     walk(handler.body, inner)
 
         walk(func.body, set())
+        keyonly = tuple(sorted(_key_only_names(func)))
         for attrs, reads in derived:
             reads = set(reads)
             frontier = list(reads)
@@ -333,7 +358,7 @@ class _Indexer:
                     if extra not in reads:
                         reads.add(extra)
                         frontier.append(extra)
-            self.derivations.append(("hook", self.hook_owner, tuple(sorted(attrs)), tuple(sorted(reads)), ()))
+            self.derivations.append(("hook", self.hook_owner, tuple(sorted(attrs)), tuple(sorted(reads)), (), keyonly))
 
     def note_defaults(self, func):
         args = func.args
@@ -398,6 +423,54 @@ def _is_pure(node):
     """A literal display of constants and names: evaluating it cannot raise or run code
     (attribute lookups on sqlglot classes and modules are plain reads)."""
     return all(isinstance(sub, _PURE_NODES) for sub in ast.walk(node))
+
+
+_KEY_CALLS = {"len", "sorted", "set", "list", "frozenset", "iter", "tuple"}
+
+
+def _key_only_names(root):
+    """Names that ``root`` only ever uses by key: as the right side of ``in``/``not in``, as
+    something iterated, through ``.keys()``, or in len()/sorted()/set()/list(). A change to a
+    dict entry's value cannot reach anything derived through such uses. A name assigned to a
+    local variable counts as used by key when every use of that local is."""
+    parents = {}
+    for node in ast.walk(root):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+
+    def key_use(node):
+        parent = parents.get(node)
+        if isinstance(parent, ast.Compare) and len(parent.ops) == 1 and isinstance(parent.ops[0], (ast.In, ast.NotIn)):
+            return parent.comparators[0] is node
+        if isinstance(parent, (ast.comprehension, ast.For, ast.AsyncFor)):
+            return parent.iter is node
+        if isinstance(parent, ast.Attribute) and parent.attr == "keys":
+            return isinstance(parents.get(parent), ast.Call)
+        if isinstance(parent, ast.Call) and isinstance(parent.func, ast.Name) and parent.func.id in _KEY_CALLS:
+            return node in parent.args
+        return False
+
+    local_uses = {}
+    for node in ast.walk(root):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            local_uses.setdefault(node.id, []).append(key_use(node))
+
+    uses = {}
+    for node in ast.walk(root):
+        if isinstance(node, ast.Attribute):
+            name = node.attr
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            name = node.id
+        else:
+            continue
+        parent = parents.get(node)
+        if (isinstance(parent, ast.Assign) and parent.value is node and len(parent.targets) == 1
+                and isinstance(parent.targets[0], ast.Name)):
+            alias = local_uses.get(parent.targets[0].id, [])
+            uses.setdefault(name, []).append(bool(alias) and all(alias))
+        else:
+            uses.setdefault(name, []).append(key_use(node))
+    return {name for name, flags in uses.items() if flags and all(flags)}
 
 
 def _dotted(node):
@@ -536,4 +609,6 @@ def index_source(source: str) -> dict:
         "pure": sorted(ix.pure_lines),
         "units": compile_units(tree),
         "annotations": ix.annotations,
+        "dict_entries": ix.dict_entries,
+        "dict_displays": ix.dict_displays,
     }
