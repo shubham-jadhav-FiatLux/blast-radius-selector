@@ -235,6 +235,8 @@ def _record_missing_args():
     """
     from sqlglot.expressions import core
 
+    if getattr(core.Expression.error_messages, "_records_missing", False):
+        return
     original = core.Expression.error_messages
 
     def error_messages(self, args=None):
@@ -251,7 +253,40 @@ def _record_missing_args():
                 noted.add((cls, key))
         return original(self, args)
 
+    error_messages._records_missing = True
     core.Expression.error_messages = error_messages
+
+
+def _record_missing_args_during_import():
+    """Installs the recorder as soon as sqlglot.expressions.core has run, so that expressions
+    sqlglot builds while it is being imported (SQL templates parsed in class bodies) are noted
+    as well, in the <import> context: making one of their missing args required breaks the
+    import itself."""
+    import importlib.abc
+    import importlib.machinery
+
+    target = "sqlglot.expressions.core"
+    if target in sys.modules:
+        print("trace_plugin: %s was imported before the profile started" % target, file=sys.stderr)
+        return
+
+    class _AfterCore(importlib.abc.MetaPathFinder):
+        def find_spec(self, name, path, target_module=None):
+            if name != target:
+                return None
+            sys.meta_path.remove(self)
+            spec = importlib.machinery.PathFinder.find_spec(name, path)
+            if spec is not None and spec.loader is not None and hasattr(spec.loader, "exec_module"):
+                run = spec.loader.exec_module
+
+                def exec_module(module):
+                    run(module)
+                    _record_missing_args()
+
+                spec.loader.exec_module = exec_module
+            return spec
+
+    sys.meta_path.insert(0, _AfterCore())
 
 
 # ----------------------------------------------------------------------------- attribute reads
@@ -870,6 +905,7 @@ def pytest_configure(config):
         mon.set_events(TOOL, mon.events.LINE)
     sys.addaudithook(_audit)
     _enter("<import>")
+    _record_missing_args_during_import()
     _import_everything()
     _record_missing_args()
     if READS:

@@ -1271,6 +1271,8 @@ class Selector:
                     continue
                 if k == IMPORT and cols is not None and ln in info["argt"]:
                     if SIMPLE_VALUE_RE.fullmatch(cols[2].strip()) and SIMPLE_VALUE_RE.fullmatch(cols[3].strip()):
+                        # (expressions sqlglot builds while it is imported count too: an arg
+                        # missing in one of those makes the set everything)
                         self.charge(acc, info["argt"][ln])
                         continue
                 if k in (IMPORT, MIXED) and cols is not None and ln in info["dflt"]:
