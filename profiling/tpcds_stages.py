@@ -27,6 +27,7 @@ import json
 import os
 import pickle
 import sys
+import unittest  # noqa: F401  sqlglot's strict argument checks are on under tests
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FRONT_TOOL, BACK_TOOL = 3, 4

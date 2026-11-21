@@ -57,7 +57,7 @@ def run_suite(tree, out_dir, image, jobs, targets=("tests",)):
         "-v", "%s:/src:ro" % tree, "-v", "%s:/plugins:ro" % PLUGINS, "-v", "%s:/out" % out_dir,
         "-e", "PYTHONPATH=/src:/plugins", "-e", "OUTCOME_OUT=/out/outcomes.json", "-w", "/src", image,
         "python", "-m", "pytest", "-q", "-p", "outcome_plugin", "-p", "no:cacheprovider",
-        *parallel, "--timeout", "600", *targets,
+        *parallel, "--continue-on-collection-errors", "--timeout", "600", *targets,
     ]
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3600)
     with open(out) as f:

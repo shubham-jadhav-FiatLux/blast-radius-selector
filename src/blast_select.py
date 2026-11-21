@@ -26,6 +26,7 @@ import marshal
 import os
 import re
 import sys
+import unittest  # noqa: F401  sqlglot turns on its strict argument checks when tests run; so do we
 import zlib
 
 import tpcds_check
@@ -60,7 +61,7 @@ POINTS_PATH = os.path.splitext(PLANS_PATH)[0] + "_points.pickle"
 # Imports the given sqlglot modules with some files replaced by patched copies, and prints the
 # ones that fail. argv: <pinned sources> <overlay dir> <modules to skip> <modules to import>
 IMPORT_CHECK = r"""
-import importlib, importlib.util, os, sys
+import importlib, importlib.util, os, sys, unittest
 root, overlay = sys.argv[1], sys.argv[2]
 skip = set(filter(None, sys.argv[3].split(",")))
 wanted = list(filter(None, sys.argv[4].split(",")))

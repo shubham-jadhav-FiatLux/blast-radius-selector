@@ -81,10 +81,10 @@ edited block:
 | an edit that changes which names a function binds (`values = []` -> `exp = []` makes `exp` local everywhere in it) | every test that ran any line of that function |
 | any other edit inside a function body | every test that ran any line of the enclosing statement (with `and`/`or` short-circuiting, a test can depend on a statement without running the edited line), plus the readers of anything that code computed while sqlglot was being imported |
 | inside a lambda that an import-time table holds | the tests that called it |
-| `arg_types` flag flipped | tests that validated a node of an affected class while that argument was missing (`arg_types` values only feed `required_args`); affected classes are the class itself, its subclasses, and classes splicing in its dict |
+| `arg_types` flag flipped | tests that validated a node of an affected class while that argument was missing (`arg_types` values only feed `required_args`); affected classes are the class itself, its subclasses, and classes splicing in its dict, or a module-level dict such as `QUERY_MODIFIERS` whose other uses only look at its keys |
 | the value of one entry of a class-level dict | tests that looked up that key or used the whole dict, on the class and on dicts spreading it; tables built only from its keys (`SHOW_TRIE` from `SHOW_PARSERS`, `"x" in NUMERIC_ESCAPES` in a hook) are unaffected |
 | other class attribute or module constant (including whole entries added to or removed from a table) | tests that read it, or anything derived from it, on the defining class, its subclasses, or the dialects built from them; `{**Parser.FUNCTIONS}` resolves to `Parser`, not to whichever parser happens to be nearby |
-| default value of a function argument | tests that ran the function |
+| default value of a function argument | tests that called the function without that argument (a profile pass rewrites every literal default so each use of it is noted); tests that ran the function when the default is not a literal |
 | module level code in `tests/` | tests in that module and in every module importing it |
 | data file (SQL fixtures) | the tests that opened it |
 | a module that no longer compiles or imports, or is deleted or renamed | the tests that use it or anything importing it: they ran its code, created or looked into its classes, import it (test files, at any depth), or ran an `import` inside a sqlglot function that would load it; all tests when `import sqlglot` itself loads it, or when the import hangs |
@@ -115,6 +115,9 @@ fixed hash seed in the image that uses them.
 
 A class attribute, dict entry or default argument whose new value is anything but a plain
 literal (a new name, a call) always gets the import check, whatever the old value was.
+
+sqlglot checks keyword arguments strictly when it sees `unittest` or `pytest` imported; the
+selector imports `unittest` first, so every check runs sqlglot the way the tests do.
 
 Everything that runs patched code in a child process has a deadline and a CPU limit, and all of
 it together has a budget for the batch; a child that runs over is killed, and the selection then

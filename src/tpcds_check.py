@@ -22,6 +22,7 @@ import os
 import pickle
 import sys
 import time
+import unittest  # noqa: F401  sqlglot's strict argument checks are on under tests, so they are here
 import zlib
 
 FIXTURE = "optimizer/tpc-ds/tpc-ds.sql"
@@ -252,7 +253,9 @@ def iter_front_digests(root, queries, seconds=None):
 STEPS = ["parse", "pickle", "tables", "pre"] + ["rule%d" % i for i in range(14)] + ["plan", "duckdb"]
 STEP_BIT = {name: 1 << i for i, name in enumerate(STEPS)}
 FIRST_RULE, PLAN, DUCKDB = STEPS.index("rule0"), STEPS.index("plan"), STEPS.index("duckdb")
-REPLAYABLE = STEP_BIT["tables"] | STEP_BIT["duckdb"] | sum(STEP_BIT[n] for n in STEPS[FIRST_RULE:PLAN + 1])
+REPLAYABLE = (STEP_BIT["parse"] | STEP_BIT["pickle"] | STEP_BIT["tables"] | STEP_BIT["duckdb"]
+              | sum(STEP_BIT[n] for n in STEPS[FIRST_RULE:PLAN + 1]))
+PARSED = STEP_BIT["parse"] | STEP_BIT["pickle"]
 SCHEMA = "<schema>"
 
 
@@ -279,11 +282,13 @@ def capture_checkpoints(root, k):
     from tests.helpers import TPCDS_SCHEMA, load_sql_fixture_pairs
 
     meta, sql, _ = list(load_sql_fixture_pairs(FIXTURE))[k]
+    started = time.process_time()
+    e1 = pickle.loads(pickle.dumps(parse_one(sql)))
+    parse_seconds = time.process_time() - started
     if not meta.get("execute"):
         return None
     schema = pickle.loads(pickle.dumps(TPCDS_SCHEMA))
     tables = {name: Table(columns=list(columns)) for name, columns in schema.items()}
-    e1 = pickle.loads(pickle.dumps(parse_one(sql)))
     found = {t.name: tables[t.name] for t in find_tables(e1)}
     rules = optimizer.RULES
     inputs, outs, kwargs_of = [None] * len(rules), [None] * len(rules), [None] * len(rules)
@@ -340,8 +345,12 @@ def capture_checkpoints(root, k):
         "inputs": inputs, "kwargs": kwargs_of, "outs": outs,
         "plan_input": taken["plan_input"], "plan": plan_digest(taken["plan"]),
         "duckdb": _digest(transpile(sql, write="duckdb")[0]), "sql_k": k,
-        "seconds": [round(x, 5) for x in spent],
+        "seconds": [round(x, 5) for x in spent] + [round(parse_seconds, 5)],
+        # what parse_one and the pickle round trip give: everything after starts from it
+        "e1_digest": plan_digest(e1),
     }
+    again = plan_digest(pickle.loads(pickle.dumps(parse_one(sql))))
+    point["parse_ok"] = again == point["e1_digest"]
     # each checkpoint must reproduce its step's output exactly when replayed on its own
     point["ok"] = [replay_steps(point, i, i) == outs[i] for i in range(len(rules))]
     point["plan_ok"] = replay_steps(point, PLAN - FIRST_RULE, PLAN - FIRST_RULE) == point["plan"]
@@ -382,6 +391,10 @@ def replay_cost(step_seconds, steps):
     cost = 0.004  # decoding the checkpoint
     if span:
         cost += sum(step_seconds[min(span):max(span) + 1])
+    if steps & PARSED:
+        if len(step_seconds) <= PLAN - FIRST_RULE + 1:
+            return None
+        cost += step_seconds[PLAN - FIRST_RULE + 1]
     if steps & STEP_BIT["duckdb"]:
         cost += 0.006
     if steps & STEP_BIT["tables"]:
@@ -398,6 +411,17 @@ def checkpoint_check(root, point, steps):
         sys.path.insert(0, root)
     if steps & ~REPLAYABLE:
         return None
+    if steps & PARSED:
+        # parsing (and the pickle round trip into the worker) must give the very same tree;
+        # then every later step starts from what it started from at the pinned commit
+        if not point.get("parse_ok"):
+            return None
+        from sqlglot import parse_one
+        from tests.helpers import load_sql_fixture_pairs
+
+        sql = list(load_sql_fixture_pairs(FIXTURE))[point["sql_k"]][1]
+        if plan_digest(pickle.loads(pickle.dumps(parse_one(sql)))) != point["e1_digest"]:
+            return False
     nrules = len(point["inputs"])
     span = [i - FIRST_RULE for i in range(FIRST_RULE, PLAN + 1) if steps & (1 << i)]
     if span:

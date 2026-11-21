@@ -149,6 +149,9 @@ def _flush(ctx):
         import json
 
         _out.write("Y %s\t%s\n" % (ctx, json.dumps(sorted({(tag, _key_text(k)) for tag, k in keyed}))))
+    dflt = _defaults_used.pop(ctx, None)
+    if dflt:
+        _out.write("E %s\t%s\n" % (ctx, ",".join(map(str, sorted(dflt)))))
     dyn = _dyn_imports.pop(ctx, None)
     if dyn:
         _out.write("M %s\t%s\n" % (ctx, ",".join(sorted(dyn))))
@@ -267,6 +270,11 @@ USERS = os.environ.get("PROFILE_USERS") == "1"
 # a test class's setUpClass loads from a SQL fixture are served as recording copies
 # ("P <tag>\t<fixture>\t<loader>", then "D <ctx>\t<tag>,..." for the tests that read them).
 DATA = os.environ.get("PROFILE_DATA") == "1"
+# With PROFILE_DEFAULTS=1 (a run of its own, no line tracing): literal defaults of sqlglot
+# functions are rewritten so that each use of one is noted ("E <ctx>\t<site>,..."; the sites
+# are listed once in a "G" record). See defaults_rewrite.py.
+DEFAULTS = os.environ.get("PROFILE_DEFAULTS") == "1"
+_defaults_used = {}
 _dyn_imports = {}
 _data_reads = {}
 _registry_base = {}
@@ -745,6 +753,33 @@ def _weak_set():
     return seen
 
 
+def _install_defaults_loader():
+    import importlib.machinery
+    import importlib.util
+
+    import defaults_rewrite
+
+    prefix = ROOT + "sqlglot" + os.sep
+
+    class DefaultsLoader(importlib.machinery.SourceFileLoader):
+        def get_code(self, fullname):
+            path = self.get_filename(fullname)
+            if not path.startswith(prefix):
+                return super().get_code(fullname)
+            source = importlib.util.decode_source(self.get_data(path))
+            return defaults_rewrite.rewrite(source, path[len(ROOT):], path)
+
+    m = importlib.machinery
+    hook = m.FileFinder.path_hook(
+        (m.ExtensionFileLoader, m.EXTENSION_SUFFIXES),
+        (DefaultsLoader, m.SOURCE_SUFFIXES),
+        (m.SourcelessFileLoader, m.BYTECODE_SUFFIXES),
+    )
+    sys.path_hooks.insert(0, hook)
+    sys.path_importer_cache.clear()
+    defaults_rewrite.install(lambda site: _note(_defaults_used, site))
+
+
 def _install_weak_loader():
     import importlib.machinery
     import importlib.util
@@ -780,6 +815,8 @@ def pytest_configure(config):
     mon.register_callback(TOOL, mon.events.LINE, _on_line)
     if WEAK:
         _install_weak_loader()
+    elif DEFAULTS:
+        _install_defaults_loader()
     else:
         mon.set_events(TOOL, mon.events.LINE)
     sys.addaudithook(_audit)
@@ -905,7 +942,7 @@ def pytest_runtest_call(item):
         _enter(item.nodeid + "|call")
     else:
         yield
-    for ctx in [c for c in set(_lines) | set(_weak) | set(_attr_reads) | set(_reads) | set(_key_reads) | set(_users) | set(_dyn_imports) | set(_data_reads) if c.startswith(item.nodeid + "|call")]:
+    for ctx in [c for c in set(_lines) | set(_weak) | set(_attr_reads) | set(_reads) | set(_key_reads) | set(_users) | set(_dyn_imports) | set(_data_reads) | set(_defaults_used) if c.startswith(item.nodeid + "|call")]:
         _flush(ctx)
 
 
@@ -921,7 +958,7 @@ def pytest_runtest_teardown(item, nextitem):
 
 def pytest_sessionfinish(session, exitstatus):
     mon.set_events(TOOL, 0)
-    for ctx in list(set(_lines) | set(_reads) | set(_missing) | set(_attr_reads) | set(_weak) | set(_key_reads) | set(_users) | set(_dyn_imports) | set(_data_reads)):
+    for ctx in list(set(_lines) | set(_reads) | set(_missing) | set(_attr_reads) | set(_weak) | set(_key_reads) | set(_users) | set(_dyn_imports) | set(_data_reads) | set(_defaults_used)):
         _flush(ctx)
     if WEAK:
         import json
@@ -929,6 +966,12 @@ def pytest_sessionfinish(session, exitstatus):
         import weak_rewrite
 
         _out.write("S\t%s\n" % json.dumps(weak_rewrite.SITES))
+    if DEFAULTS:
+        import json
+
+        import defaults_rewrite
+
+        _out.write("G\t%s\n" % json.dumps(defaults_rewrite.SITES))
     for (fid, line), origins in _origins.items():
         _out.write("I %d:%d\t%s\n" % (fid, line, ",".join("%d:%d" % o for o in sorted(origins))))
     for path, fid in _files.items():

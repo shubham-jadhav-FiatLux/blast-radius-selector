@@ -12,6 +12,7 @@ bitsets over test indices; ``GLOBAL`` (-2) means "every test".
 from __future__ import annotations
 
 import argparse
+import ast
 import gzip
 import hashlib
 import json
@@ -91,6 +92,10 @@ def read_profile(paths, meta=None):
                     ofid, oline = item.split(":")
                     dest.add((files[int(ofid)], int(oline)))
                 continue
+            if kind == "G":
+                for site, entry in enumerate(json.loads(rest.lstrip("\t"))):
+                    meta.setdefault("default_sites", {})[(path, site)] = tuple(entry)
+                continue
             if kind == "P":
                 tag, path, loader = (rest.split("\t") + ["", ""])[:3]
                 meta.setdefault("provenance", {})[tag] = (path, loader)
@@ -117,6 +122,8 @@ def read_profile(paths, meta=None):
                 entry.setdefault("weak", set()).update(int(c) for c in payload.split(","))
             elif kind == "U" and payload:
                 entry.setdefault("users", set()).update(payload.split(","))
+            elif kind == "E" and payload:
+                entry.setdefault("defaults", set()).update((path, int(x)) for x in payload.split(","))
             elif kind == "M" and payload:
                 entry.setdefault("dyn", set()).update(payload.split(","))
             elif kind == "D" and payload:
@@ -347,7 +354,59 @@ def test_module_scopes(src, tests):
 
 
 # ----------------------------------------------------------------------------- arg_types
-def argtypes_graph(src, static):
+def _dict_owner(value, defined):
+    """"module.NAME" of the module-level dict display that ``value`` is, found by identity
+    among the modules holding it and the dict displays the source index saw."""
+    for name, mod in list(sys.modules.items()):
+        if name.split(".")[0] != "sqlglot" or mod is None:
+            continue
+        for attr, obj in list(vars(mod).items()):
+            if obj is value and (name, attr) in defined:
+                return "%s.%s" % (name, attr)
+    return None
+
+
+def key_only_uses(src, name, files):
+    """True if every reference to the module-level dict ``name`` outside arg_types splices only
+    looks at its keys: iterating it, or an ``in`` test against it."""
+    import ast as _ast
+
+    for rel, ix in files.items():
+        if not rel.startswith("sqlglot/"):
+            continue
+        with open(os.path.join(src, rel), encoding="utf-8") as f:
+            text = f.read()
+        if name not in text:
+            continue
+        tree = _ast.parse(text)
+        ok_nodes = set()
+        for node in _ast.walk(tree):
+            if isinstance(node, (_ast.For, _ast.comprehension)):
+                ok_nodes.add(id(node.iter))
+            elif isinstance(node, _ast.Compare):
+                for op, right in zip(node.ops, node.comparators):
+                    if isinstance(op, (_ast.In, _ast.NotIn)):
+                        ok_nodes.add(id(right))
+            elif isinstance(node, _ast.Dict):
+                for k, v in zip(node.keys, node.values):
+                    if k is None:
+                        ok_nodes.add(id(v))  # ** splice; arg_types splices are handled as arg_types
+            elif isinstance(node, (_ast.Import, _ast.ImportFrom)):
+                for alias in node.names:
+                    if alias.name == name:
+                        ok_nodes.add(id(alias))
+            elif isinstance(node, _ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, _ast.Name) and target.id == name:
+                        ok_nodes.add(id(target))  # the definition itself
+        for node in _ast.walk(tree):
+            ref = (isinstance(node, _ast.Name) and node.id == name) or (isinstance(node, _ast.Attribute) and node.attr == name)
+            if ref and id(node) not in ok_nodes:
+                return False
+    return True
+
+
+def argtypes_graph(src, static, defined_dicts=frozenset()):
     """Edges origin class -> classes whose arg_types (and so required_args) derive from it.
 
     A class inherits arg_types unless it assigns its own, and an own dict can splice in another
@@ -410,8 +469,11 @@ def argtypes_graph(src, static):
                         edges[key(target)].add(k)
                         continue
                     if isinstance(target, dict):
-                        # A module-level dict spliced in: edits to it are module-level and run
-                        # everything anyway; this class's own entries stay traceable.
+                        # A module-level dict spliced in (``**QUERY_MODIFIERS``): the class
+                        # derives from it like from another class's arg_types.
+                        owner = _dict_owner(target, defined_dicts)
+                        if owner is not None:
+                            edges["dict:" + owner].add(k)
                         continue
                 opaque.append(k)
         else:
@@ -433,6 +495,7 @@ def main():
     ap.add_argument("--keys", nargs="*", default=[], help="profiles recorded with PROFILE_KEYS=1 (also in --profile)")
     ap.add_argument("--tpcds", default=None, help="reference fingerprints from src/tpcds_check.py")
     ap.add_argument("--tpcds-stages", default=None, help="front/back lines per query from profiling/tpcds_stages.py")
+    ap.add_argument("--defaults", nargs="*", default=[], help="profiles recorded with PROFILE_DEFAULTS=1")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     src = os.path.abspath(args.src)
@@ -514,7 +577,12 @@ def main():
                 static_argtypes[(rel, qualname)] = info
             files[rel] = ix
 
-    edges, by_site, opaque = argtypes_graph(src, static_argtypes)
+    defined_dicts = {(module_name(rel), name) for rel, ix in files.items() if rel.startswith("sqlglot/")
+                     for qual, name in ix.get("dict_displays", []) if not qual}
+    edges, by_site, opaque = argtypes_graph(src, static_argtypes, defined_dicts)
+    spliced_ok = {origin: key_only_uses(src, origin.rsplit(".", 1)[1], files)
+                  for origin in edges if origin.startswith("dict:")}
+    print("build_map: module dicts spliced into arg_types: %s" % spliced_ok, file=sys.stderr)
     if opaque:
         print("build_map: %d classes with arg_types we cannot trace: %s" % (len(opaque), sorted(opaque)[:8]), file=sys.stderr)
 
@@ -662,6 +730,39 @@ def main():
     if not meta["families"]:
         print("build_map: profile has no class records; import-time edits will run everything", file=sys.stderr)
 
+    # ------------------------------------------------------------- default uses
+    # PROFILE_DEFAULTS=1 runs note every call that left out an argument with a literal default.
+    # An edit to such a default reaches those tests only: (rel, line, c0, c1) -> (bits or GLOBAL,
+    # queries of the per-query test or None when not known per query).
+    default_use = {}
+    if args.defaults:
+        dmeta = {}
+        dcontexts = read_profile(args.defaults, dmeta)
+        site_of = dmeta.get("default_sites", {})
+        used_bits, used_queries = {}, {}
+        for (path, site), (rel, line, c0, c1, _param, _def) in site_of.items():
+            used_bits.setdefault((rel, line, c0, c1), 0)
+            used_queries.setdefault((rel, line, c0, c1), set())
+        for ctx, entry in dcontexts.items():
+            found = entry.get("defaults")
+            if not found:
+                continue
+            charged = tests.resolve(ctx)
+            query = int(ctx[len(pq_prefix):]) if ctx.startswith(pq_prefix) else None
+            for path, site in found:
+                key = tuple(site_of[(path, site)][:4])
+                if charged == GLOBAL or used_bits[key] == GLOBAL:
+                    used_bits[key] = GLOBAL
+                    continue
+                used_bits[key] |= charged
+                if charged & pq_bit:
+                    used_queries[key].add(OUTSIDE if query is None else query)
+        for key, bits in used_bits.items():
+            queries = used_queries[key]
+            default_use[key] = (bits, None if (OUTSIDE in queries or not bits & pq_bit) else tuple(sorted(queries)))
+        print("build_map: %d literal defaults profiled, %d used by some test" % (
+            len(default_use), sum(1 for b, _ in default_use.values() if b)), file=sys.stderr)
+
     # ------------------------------------------------------------- users of classes and modules
     # Edits nothing above models (an arg_types key renamed, a statement dropped, a module that
     # no longer imports) reach only tests that use the class or module they sit in: tests that
@@ -797,6 +898,31 @@ def main():
                     else:
                         bits |= m
             argt[ln] = GLOBAL if glob else table.add(bits)
+        # entries of a module-level dict spliced into arg_types, whose other uses look at keys only
+        if rel.startswith("sqlglot/"):
+            for ln, entries in ix.get("dict_entries", {}).items():
+                for qualname, attr, source, c0, c1 in entries:
+                    origin = "dict:%s.%s" % (module_name(rel), attr)
+                    if qualname or origin not in edges or not spliced_ok.get(origin):
+                        continue
+                    try:
+                        arg = ast.literal_eval(source)
+                    except (ValueError, SyntaxError):
+                        continue
+                    if not isinstance(arg, str):
+                        continue
+                    bits, glob = 0, False
+                    for cls in descendants(origin):
+                        if cls == origin:
+                            continue
+                        if cls in opaque:
+                            glob = True
+                        m = missing.get((cls, arg), 0)
+                        if m == GLOBAL:
+                            glob = True
+                        else:
+                            bits |= m
+                    argt[ln] = GLOBAL if glob else table.add(bits)
 
         cattr = {}
         kattr = {}
@@ -831,13 +957,24 @@ def main():
                         check = True
                 cattr[ln] = (table.add(bits), check)
         for ln, entries in ix["defaults"].items():
-            # a default reaches whoever ran the function's body:
+            # a default reaches whoever ran the function's body, or, when the default-use
+            # profile covers it, whoever called the function without that argument:
             # (c0, c1, set, check, queries, back, steps)
-            dflt[ln] = [
-                (c0, c1, *span_set(b0, b1)[:1], any((rel, l2) in via_import for l2 in range(b0, b1 + 1)),
-                 *span_set(b0, b1)[1:], span_steps(b0, b1))
-                for c0, c1, b0, b1 in entries
-            ]
+            out = []
+            for c0, c1, b0, b1 in entries:
+                sid, queries, back = span_set(b0, b1)
+                check = any((rel, l2) in via_import for l2 in range(b0, b1 + 1))
+                used = default_use.get((rel, ln, c0, c1))
+                if used is not None and used[0] != GLOBAL and sid != GLOBAL:
+                    bits, used_queries = used
+                    sid = table.add(bits)
+                    if bits & pq_bit:
+                        queries = used_queries
+                        back = tuple(q for q in back if queries is not None and q in queries)
+                    else:
+                        queries, back = None, ()
+                out.append((c0, c1, sid, check, queries, back, span_steps(b0, b1)))
+            dflt[ln] = out
 
         class_fb = []
         if rel.startswith("sqlglot/"):
