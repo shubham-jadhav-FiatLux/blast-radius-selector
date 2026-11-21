@@ -18,6 +18,7 @@ RUN python -c "import tarfile; tarfile.open('/tmp/sqlglot-src.tar.xz').extractal
     && python -m compileall -q /app/sqlglot-src/sqlglot \
     && python -S -B /app/import_baseline.py /app/sqlglot-src /app/import_baseline.txt \
     && python -S -B /app/tpcds_check.py --plans /app/sqlglot-src /app/tpcds_plans.json \
+    && python -S -B /app/max_nodes_check.py --reference /app/sqlglot-src /app/max_nodes_ref.json \
     && python -m compileall -q /app/blast_select.py \
     && chmod -R a+rX /app
 

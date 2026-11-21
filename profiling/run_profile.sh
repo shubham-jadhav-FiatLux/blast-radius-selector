@@ -3,6 +3,7 @@
 #   trace  line coverage, file reads, validation, class attribute reads, dict keys and the
 #          classes each test creates or generates SQL for
 #   weak   comparisons and boolean operators evaluated against their swapped forms
+#   defaults  which calls leave out an argument that has a literal default
 #   profiling/run_profile.sh <profile image> <sqlglot checkout> <output dir> [seed]
 # test_max_nodes needs about 1.7 GB on its own, so each pass runs it in a second container.
 set -euo pipefail
@@ -25,3 +26,5 @@ run trace_main PROFILE_READS 2800m tests --deselect "$max_nodes"
 run trace_max_nodes PROFILE_READS 3500m "$max_nodes"
 run weak_main PROFILE_WEAK 2800m tests --deselect "$max_nodes"
 run weak_max_nodes PROFILE_WEAK 3500m "$max_nodes"
+run defaults_main PROFILE_DEFAULTS 2800m tests --deselect "$max_nodes"
+run defaults_max_nodes PROFILE_DEFAULTS 3500m "$max_nodes"

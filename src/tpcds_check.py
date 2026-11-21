@@ -113,6 +113,102 @@ def plan_digest(value):
     return fp(value)
 
 
+def value_digest(value):
+    """A digest of a value computed while sqlglot was imported (a parsed template, a table of
+    token types, a dict of builder functions...), comparable between two imports of the same
+    modules: functions by their code, constants, defaults and closures; classes and modules by
+    name; expressions as in plan_digest. Cycles are cut, identities never used."""
+    import enum
+    import re as _re
+    import types
+
+    from sqlglot.expressions.core import Expr
+
+    memo = {}
+    atoms = (str, int, float, bool, bytes, complex, type(None))
+
+    def node(parts):
+        return hashlib.blake2b(repr(parts).encode("utf-8"), digest_size=16).hexdigest()
+
+    def code(c):
+        return node(["C", c.co_name, c.co_code, [fp(k) for k in c.co_consts], c.co_names, c.co_varnames,
+                     c.co_freevars, c.co_cellvars, c.co_argcount, c.co_kwonlyargcount, c.co_flags])
+
+    def fp(v):
+        if isinstance(v, atoms):
+            return "%s:%r" % (type(v).__name__, v)
+        key = id(v)
+        got = memo.get(key)
+        if got is not None:
+            return got
+        memo[key] = "cycle"
+        if isinstance(v, Expr):
+            parts = ["E", type(v).__module__, type(v).__qualname__]
+            parts.extend((n, fp(a)) for n, a in v.args.items())
+            parts += [fp(getattr(v, "_type", None)), fp(getattr(v, "comments", None)), fp(getattr(v, "_meta", None))]
+            out = node(parts)
+        elif isinstance(v, enum.Enum):
+            out = "N:%s.%s.%s" % (type(v).__module__, type(v).__qualname__, v.name)
+        elif isinstance(v, type):
+            out = "T:%s.%s" % (v.__module__, v.__qualname__)
+        elif isinstance(v, types.ModuleType):
+            out = "M:" + v.__name__
+        elif isinstance(v, types.CodeType):
+            out = code(v)
+        elif isinstance(v, types.FunctionType):
+            cells = []
+            for cell in v.__closure__ or ():
+                try:
+                    cells.append(fp(cell.cell_contents))
+                except ValueError:
+                    cells.append("empty")
+            out = node(["F", v.__module__, v.__qualname__, code(v.__code__), fp(v.__defaults__),
+                        fp(v.__kwdefaults__), cells])
+        elif isinstance(v, (types.MethodType,)):
+            out = node(["B", fp(v.__func__), fp(type(v.__self__))])
+        elif isinstance(v, (staticmethod, classmethod)):
+            out = node([type(v).__name__, fp(v.__func__)])
+        elif isinstance(v, property):
+            out = node(["P", fp(v.fget), fp(v.fset), fp(v.fdel)])
+        elif isinstance(v, (types.BuiltinFunctionType, types.BuiltinMethodType)):
+            out = "X:%s" % getattr(v, "__qualname__", repr(v))
+        elif isinstance(v, _re.Pattern):
+            out = node(["re", v.pattern, v.flags])
+        elif isinstance(v, (list, tuple)):
+            out = node([type(v).__name__] + [fp(x) for x in v])
+        elif isinstance(v, dict):
+            # as a mapping: tables built by iterating sets of classes come out in an order that
+            # differs from one import to the next already, so nothing can rely on it
+            out = node(["dict"] + sorted((fp(a), fp(b)) for a, b in v.items()))
+        elif isinstance(v, (set, frozenset)):
+            out = node([type(v).__name__] + sorted(fp(x) for x in v))
+        else:
+            fields = []
+            if hasattr(v, "__dict__"):
+                fields.append(fp(vars(v)))
+            for klass in type(v).__mro__:
+                for slot in getattr(klass, "__slots__", ()) or ():
+                    if isinstance(slot, str) and hasattr(v, slot):
+                        fields.append((slot, fp(getattr(v, slot))))
+            out = node(["O", type(v).__module__, type(v).__qualname__, fields]) if fields else \
+                node(["R", type(v).__qualname__, repr(v)])
+        memo[key] = out
+        return out
+
+    return fp(value)
+
+
+def import_value(spec):
+    """The value of (module, class qualname or "", name) as now imported."""
+    import importlib
+
+    module, qualname, name = spec
+    obj = importlib.import_module(module)
+    for part in qualname.split(".") if qualname else ():
+        obj = getattr(obj, part)
+    return vars(obj)[name] if isinstance(obj, type) and name in vars(obj) else getattr(obj, name)
+
+
 class _Planned(Exception):
     pass
 

@@ -57,6 +57,9 @@ IMPORT_BASELINE = os.environ.get("BLAST_IMPORT_BASELINE", os.path.join(HERE, "im
 # and the checkpoints of the steps that lead to it.
 PLANS_PATH = os.environ.get("BLAST_TPCDS_PLANS", os.path.join(HERE, "tpcds_plans.json"))
 POINTS_PATH = os.path.splitext(PLANS_PATH)[0] + "_points.pickle"
+# What test_max_nodes sees on scaled copies of its input at the pinned commit (max_nodes_check.py).
+MAX_NODES_REF = os.environ.get("BLAST_MAX_NODES_REF", os.path.join(HERE, "max_nodes_ref.json"))
+MAX_NODES_TEST = "tests/test_parser.py::TestParser::test_max_nodes"
 
 # Imports the given sqlglot modules with some files replaced by patched copies, and prints the
 # ones that fail. argv: <pinned sources> <overlay dir> <modules to skip> <modules to import>
@@ -382,6 +385,15 @@ class Selector:
         self.files = blob["files"]
         self.reads = blob["reads"]
         self.class_data = blob.get("class_data", {})
+        self.mx_bit = 0
+        self.mx_ref = None
+        if MAX_NODES_TEST in blob.get("tests", ()):
+            try:
+                with open(MAX_NODES_REF) as f:
+                    self.mx_ref = json.load(f)
+                self.mx_bit = 1 << list(blob["tests"]).index(MAX_NODES_TEST)
+            except (OSError, ValueError):
+                pass
         self.scopes = blob["scopes"]
         self.sets = blob["sets"]
         self.fresh = blob.get("fresh", [])
@@ -413,6 +425,7 @@ class Selector:
         self.import_check = set()
         self.unmodeled = set()
         self.import_hung = False
+        self.import_values = set()
         self.patched = {}
         self.changed = {}
         for change in parse_patch(patch_text):
@@ -432,8 +445,12 @@ class Selector:
             if self.core is None or any(_module_of(p) in self.core for p in self.import_check):
                 for index in self.fresh:  # these import sqlglot in a fresh interpreter
                     acc[0] |= 1 << index
+        # test_max_nodes first: while it is in, leaving out the per-query test saves little
+        if not acc[1] and acc[0] & self.mx_bit and self.max_nodes_recheck():
+            acc[0] &= ~self.mx_bit
         if not acc[1] and acc[0] & self.pq_bit and not acc[3] and acc[2]:
-            if self.recheck_queries(acc[2], self.saving_without(acc[0], self.pq_bit), acc[4], acc[5]):
+            if self.recheck_queries(acc[2], self.saving_without(acc[0], self.pq_bit), acc[4], acc[5],
+                                    sorted(self.import_values)):
                 acc[0] &= ~self.pq_bit
         return acc
 
@@ -454,7 +471,7 @@ class Selector:
 
         return (_cost(split(numbers(bits), self.ms), self.ms) - _cost(split(numbers(bits & ~drop), self.ms), self.ms)) / 1000
 
-    def recheck_queries(self, queries, saving=float("inf"), back=None, steps=0):
+    def recheck_queries(self, queries, saving=float("inf"), back=None, steps=0, values=()):
         """True if the per-query test still passes for every query the edit can reach.
 
         A query the edit only reaches before its plan exists (parsing, optimizing, planning)
@@ -499,10 +516,24 @@ class Selector:
         script = os.path.join(HERE, "tpcds_check.py")
         by_points = sorted((k for k in cheap if replay[k] is not None), key=lambda q: replay[q])
 
-        def same():
+        def snapshot():
+            # in the child, before the patched modules replace the pinned ones
+            return {v: tpcds_check.value_digest(tpcds_check.import_value(v)) for v in values}
+
+        def same(before=None):
             import importlib.util
             import pickle
             import signal
+
+            spec = importlib.util.spec_from_file_location("tpcds_check", script)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            if values:
+                for v in values:
+                    if module.value_digest(module.import_value(v)) != before.get(v):
+                        log("per-query test: what the import computed with the edited code differs (%s.%s)"
+                            % (v[0] + ("." + v[1] if v[1] else ""), v[2]))
+                        return False
 
             class OverTime(Exception):
                 pass
@@ -520,9 +551,6 @@ class Selector:
                 finally:
                     signal.setitimer(signal.ITIMER_PROF, 0)
 
-            spec = importlib.util.spec_from_file_location("tpcds_check", script)
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
             state = {"spent": estimate, "loaded": any(ref["rows"][k] is not None for k in full)}
 
             def results_same(k):
@@ -570,10 +598,30 @@ class Selector:
                     return False
             return True
 
-        ok = self.in_patched_child(same, timeout=min(CHILD_SECONDS, 3 * limit + 3))
+        ok = self.in_patched_child(same, timeout=min(CHILD_SECONDS, 3 * limit + 3), snapshot=snapshot if values else None)
         if ok:
             log("per-query test passes for queries", sorted(queries),
                 "(%d by checkpoints, %d by plan) - left out" % (len(by_points), len(cheap) - len(by_points)))
+        return ok
+
+    def max_nodes_recheck(self):
+        """True if test_max_nodes, run on scaled copies of its input over the patched sources,
+        gives exactly what it gives at the pinned commit (see max_nodes_check.py)."""
+        if self.mx_ref is None or any(path.startswith("tests/") for path in self.changed):
+            return False
+        script = os.path.join(HERE, "max_nodes_check.py")
+        reference = self.mx_ref
+
+        def same():
+            import importlib.util
+
+            spec = importlib.util.spec_from_file_location("max_nodes_check", script)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module.same_as(reference, module.observe(self.sources))
+
+        ok = self.in_patched_child(same, timeout=min(CHILD_SECONDS, 10.0))
+        log("test_max_nodes on scaled input:", "same as at the pinned commit - left out" if ok else "differs; kept")
         return ok
 
     def imports_cleanly(self):
@@ -619,7 +667,7 @@ class Selector:
         finally:
             shutil.rmtree(overlay, ignore_errors=True)
 
-    def in_patched_child(self, check, timeout=CHILD_SECONDS):
+    def in_patched_child(self, check, timeout=CHILD_SECONDS, snapshot=None):
         """Runs ``check()`` in a forked child with the patched modules (and their importers)
         imported again over the pinned sources. False on any error or without fork."""
         if not hasattr(os, "fork") or not os.path.isdir(self.sources):
@@ -642,14 +690,14 @@ class Selector:
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
                 with open(dest, "w", encoding="utf-8") as f:
                     f.write(text)
-            return self.forked_check(overlay, wanted, check, timeout)
+            return self.forked_check(overlay, wanted, check, timeout, snapshot)
         except Exception as error:  # noqa: BLE001
             log("patched child failed to run:", repr(error))
             return False
         finally:
             shutil.rmtree(overlay, ignore_errors=True)
 
-    def forked_check(self, overlay, wanted, check=None, timeout=CHILD_SECONDS):
+    def forked_check(self, overlay, wanted, check=None, timeout=CHILD_SECONDS, snapshot=None):
         """Imports sqlglot once in this process, then re-imports the patched modules (and the
         modules that import them) in a forked child, which costs far less than a fresh start."""
         if not self._warm:
@@ -679,6 +727,7 @@ class Selector:
                 sys.stdout = sys.stderr
                 import importlib
 
+                before = snapshot() if snapshot is not None else None
                 scope = {_module_of(p) for p in self.patched} | wanted
                 # a package imported again must not keep stale submodules around (they would be
                 # missing as attributes of the new package object), so those go too
@@ -697,7 +746,7 @@ class Selector:
                 for name in ["sqlglot"] + eager:
                     if name not in self.baseline():
                         importlib.import_module(name)
-                status = 0 if check is None or check() else 1
+                status = 0 if check is None or (check(before) if snapshot is not None else check()) else 1
             except BaseException as error:  # noqa: BLE001
                 if check is not None:
                     log("patched child:", repr(error)[:300])
@@ -1074,6 +1123,20 @@ class Selector:
             self.patched[path] = text
         return text
 
+    def charge_line(self, acc, info, ln):
+        """Charges the tests of a function line, with its queries of the per-query test. A line
+        that also ran while sqlglot was imported has them only on condition that what the
+        import computed with it comes out the same; that is checked with the queries."""
+        sets, qsets = info["sets"], info.get("qsets", {})
+        queries = qsets.get(ln)
+        if queries is None and self.plans is not None and ln in info.get("qrt", {}):
+            queries, after, values = info["qrt"][ln]
+            self.import_values.update(tuple(v) for v in values)
+            self.charge(acc, sets.get(ln, NO_TESTS), queries, self.back_of_known(queries, after),
+                        info.get("stg", {}).get(ln, 0))
+            return
+        self.charge(acc, sets.get(ln, NO_TESTS), queries, self.back_of(info, ln, queries), info.get("stg", {}).get(ln, 0))
+
     def back_of_known(self, queries, after):
         """Which of ``queries`` the map says run ``after`` planning; None when unknown."""
         if queries is None or after is None or self.plans is None:
@@ -1127,8 +1190,7 @@ class Selector:
                         continue
                 qsets = info.get("qsets", {})
                 if k == RUNTIME:
-                    self.charge(acc, sets.get(ln, NO_TESTS), qsets.get(ln), self.back_of(info, ln, qsets.get(ln)),
-                                info.get("stg", {}).get(ln, 0))
+                    self.charge_line(acc, info, ln)
                     if ln in info["checks"]:
                         self.import_check.add(path)
                     continue
@@ -1138,8 +1200,7 @@ class Selector:
                 if k == MIXED and cols is not None:
                     a, z = cols[0], max(cols[1], cols[0] + 1)
                     if any(c0 <= a and z <= c1 for c0, c1 in info["cols"].get(ln, ())):
-                        self.charge(acc, sets.get(ln, NO_TESTS), qsets.get(ln), self.back_of(info, ln, qsets.get(ln)),
-                                    info.get("stg", {}).get(ln, 0))
+                        self.charge_line(acc, info, ln)
                         if ln in info["checks"]:
                             self.import_check.add(path)
                         continue

@@ -113,6 +113,21 @@ The test is left out only when every reached query passes, the re-check is far c
 the test, and the patch does not touch `tests/`. Plan digests and checkpoints are computed with a
 fixed hash seed in the image that uses them.
 
+Much of the parser and tokenizer also runs while sqlglot is being imported, to parse SQL
+templates and build tables. For such a line the per-query answer holds only if what the import
+computed with it is unchanged, so the re-check first digests those values (the class attributes
+and module globals the import built while running the edited code, 37 in all) as imported at
+the pinned commit and as imported with the patch, and gives up on any difference.
+
+`test_max_nodes` (28.8 s) parses a two-million-character `SELECT x=x=...=x, ...` of 10,000
+identical columns and expects the node limit to stop it. When an edit reaches it, the selector
+runs the test's small assertions as written and its two big parses on 40 and 200 columns with
+proportional limits (`src/max_nodes_check.py`), and leaves the test out if every result and
+error message (limit, position, highlighted context) matches the pinned commit and the cost
+grows from the smaller size to the larger as it did there. This is strong evidence, not proof:
+only code that behaves differently after hundreds of identical columns could pass it and still
+fail the test, and nothing in the tokenizer or parser keys on input size.
+
 A class attribute, dict entry or default argument whose new value is anything but a plain
 literal (a new name, a call) always gets the import check, whatever the old value was.
 
@@ -167,6 +182,8 @@ data/sqlglot-src.tar.xz the pinned sqlglot sources (Python files and TPC-DS fixt
                         verified file by file against the map; without them, edits run everything
 src/fetch_sources.py    downloads the same sources from sqlglot's repository (alternative to make sources)
 src/import_baseline.py  build-time list of modules that fail to import even unpatched
+src/tpcds_check.py      the TPC-DS re-check: plan digests, step checkpoints, result fingerprints
+src/max_nodes_check.py  the scaled re-check of test_max_nodes
 data/map.bin            the map built from the pinned commit
 profiling/              plugins (tracing, weak mutation, class users), source indexer, the TPC-DS
                         stage profiler and the map builder

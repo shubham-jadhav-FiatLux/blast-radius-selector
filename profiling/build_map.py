@@ -660,6 +660,25 @@ def main():
         eff_cache[key] = bits
         return bits
 
+    def import_values(rel, a, b):
+        """The class attributes and module globals (module, class qualname or "", name) whose
+        import-time computation ran any of lines a..b; None if one of those runs cannot be
+        traced to an assignment."""
+        out = set()
+        for l2 in range(a, b + 1):
+            if (rel, l2) not in via_import:
+                continue
+            found = origins.get((rel, l2))
+            if not found:
+                return None
+            for orel, oline in found:
+                entries = files[orel]["classattr"].get(oline) if orel in files and orel.startswith("sqlglot/") else None
+                if not entries:
+                    return None
+                for qualname, name in entries:
+                    out.add((module_name(orel), qualname or "", name))
+        return tuple(sorted(out))
+
     def union_eff(rel, lines):
         bits = 0
         for ln in lines:
@@ -834,15 +853,35 @@ def main():
             if sid < 0 or not table.sets[sid] & pq_bit:
                 return sid, None, ()
             queries = set()
+            imported = False
             for l2 in range(a, b + 1):
                 seen = qcov.get((rel, l2), set())
                 if "unsplit" in seen and not any(isinstance(q, int) and q >= 0 for q in seen):
                     queries.add(OUTSIDE)  # only the unsplit runs saw the test here
                 queries |= {q for q in seen if q != "unsplit"}
                 if (rel, l2) in via_import:
-                    queries.add(OUTSIDE)
+                    imported = True
             queries |= staged
+            span_set.runtime = None
+            if imported and queries and OUTSIDE not in queries:
+                # Runs at import too: per query only if what the import computed with it comes
+                # out the same, which the selector checks (the values are listed in "imp").
+                values = import_values(rel, a, b)
+                if values is not None:
+                    span_set.runtime = (tuple(sorted(queries)), values)
+            if imported:
+                queries.add(OUTSIDE)
             if not queries or OUTSIDE in queries:
+                if span_set.runtime is not None:
+                    runtime_queries = set(span_set.runtime[0])
+                    back = set()
+                    for l2 in range(a, b + 1):
+                        back |= stage_back.get((rel, l2), set())
+                        for q in qcov.get((rel, l2), ()):
+                            if isinstance(q, int) and q >= 0 and q not in stage_front.get((rel, l2), ()) \
+                                    and q not in stage_back.get((rel, l2), ()):
+                                back.add(q)
+                    span_set.runtime = (span_set.runtime[0], tuple(sorted(back & runtime_queries)), span_set.runtime[1])
                 return sid, None, ()
             back = set()
             if stage_front or stage_back:
@@ -862,6 +901,7 @@ def main():
             return mask
 
         stg = {}
+        qrt = {}  # line -> (queries, back queries, import-time values to compare), see span_set
         for ln in range(1, ix["n"] + 1):
             k = kind[ln - 1]
             if k not in (RUNTIME, MIXED):
@@ -874,6 +914,11 @@ def main():
                     qsets[ln] = queries
                     if back:
                         xq[ln] = back
+                    steps = span_steps(a, b)
+                    if steps:
+                        stg[ln] = steps
+                elif getattr(span_set, "runtime", None) is not None:
+                    qrt[ln] = span_set.runtime
                     steps = span_steps(a, b)
                     if steps:
                         stg[ln] = steps
@@ -1000,6 +1045,7 @@ def main():
             "qsets": qsets,
             "xq": xq,
             "stg": stg,
+            "qrt": qrt,
             "units": [x for unit in ix["units"] for x in unit],
             "annot": ix["annotations"],
             "pure": set(ix["pure"]),
