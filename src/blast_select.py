@@ -60,6 +60,13 @@ POINTS_PATH = os.path.splitext(PLANS_PATH)[0] + "_points.pickle"
 # What test_max_nodes sees on scaled copies of its input at the pinned commit (max_nodes_check.py).
 MAX_NODES_REF = os.environ.get("BLAST_MAX_NODES_REF", os.path.join(HERE, "max_nodes_ref.json"))
 MAX_NODES_TEST = "tests/test_parser.py::TestParser::test_max_nodes"
+# A selection this small is cheaper to run here than to pay a worker for: dialect tests only
+# (they need nothing beyond sqlglot and the standard library), at most this many, recorded at
+# most this long together.
+RERUN_MAX_TESTS = 8
+RERUN_MAX_MS = 1000
+RERUN_DIRS = ("tests/dialects/",)
+RERUN_UNAVAILABLE = ("tests/dialects/test_bigquery.py",)  # needs pytz
 
 # Imports the given sqlglot modules with some files replaced by patched copies, and prints the
 # ones that fail. argv: <pinned sources> <overlay dir> <modules to skip> <modules to import>
@@ -385,6 +392,8 @@ class Selector:
         self.files = blob["files"]
         self.reads = blob["reads"]
         self.class_data = blob.get("class_data", {})
+        self.source_readers = blob.get("source_readers", {})
+        self.test_ids = list(blob.get("tests", ()))
         self.mx_bit = 0
         self.mx_ref = None
         if MAX_NODES_TEST in blob.get("tests", ()):
@@ -423,6 +432,7 @@ class Selector:
         #  those queries the edit reaches after their plan exists, steps it reaches before that]
         acc = [0, False, set(), False, set(), 0]
         self.import_check = set()
+        self.touched = set()
         self.unmodeled = set()
         self.import_hung = False
         self.import_values = set()
@@ -445,6 +455,9 @@ class Selector:
             if self.core is None or any(_module_of(p) in self.core for p in self.import_check):
                 for index in self.fresh:  # these import sqlglot in a fresh interpreter
                     acc[0] |= 1 << index
+        if not acc[1] and acc[0] and self.rerun_passes(acc[0]):
+            acc[0] = 0
+            return acc
         # test_max_nodes first: while it is in, leaving out the per-query test saves little
         if not acc[1] and acc[0] & self.mx_bit and self.max_nodes_recheck():
             acc[0] &= ~self.mx_bit
@@ -602,6 +615,52 @@ class Selector:
         if ok:
             log("per-query test passes for queries", sorted(queries),
                 "(%d by checkpoints, %d by plan) - left out" % (len(by_points), len(cheap) - len(by_points)))
+        return ok
+
+    def rerun_passes(self, bits):
+        """True if a small selection of dialect tests, run with unittest over the patched
+        sources in a forked child, passes as a whole: every test runs, none fails, errors or is
+        skipped, no subtest fails. Only for edits to sqlglot's Python files."""
+        # the re-run patches Python files only: every touched file must be one of sqlglot's
+        if not self.changed or not self.touched or any(
+                not (p.startswith("sqlglot/") and p.endswith(".py")) for p in self.touched):
+            return False
+        ids, total = [], 0
+        while bits:
+            low = bits & -bits
+            i = low.bit_length() - 1
+            bits ^= low
+            if i >= len(self.test_ids) or i >= len(self.index_to_number):
+                return False
+            test = self.test_ids[i]
+            number = self.index_to_number[i]
+            if number < 0 or not test.startswith(RERUN_DIRS) or test.split("::")[0] in RERUN_UNAVAILABLE:
+                return False
+            total += self.ms.get(number, 1 << 30)
+            ids.append(test)
+            if len(ids) > RERUN_MAX_TESTS or total > RERUN_MAX_MS:
+                return False
+        if not ids:
+            return False
+        names = []
+        for test in ids:
+            parts = test.split("::")
+            if len(parts) != 3 or not parts[0].endswith(".py"):
+                return False
+            names.append("%s.%s.%s" % (parts[0][:-3].replace("/", "."), parts[1], parts[2]))
+
+        def run():
+            import unittest as ut
+
+            suite = ut.TestLoader().loadTestsFromNames(names)
+            result = ut.TestResult()
+            result.failfast = True  # the first failure decides; the rest need not run
+            suite.run(result)
+            return result.testsRun == len(names) and result.wasSuccessful() and not result.skipped \
+                and not result.expectedFailures and not result.unexpectedSuccesses
+
+        ok = self.in_patched_child(run, timeout=min(CHILD_SECONDS, 3.0 + 3 * total / 1000))
+        log("%d selected dialect tests re-run here:" % len(names), "all pass - none scheduled" if ok else "kept")
         return ok
 
     def max_nodes_recheck(self):
@@ -820,6 +879,7 @@ class Selector:
 
     def file_change(self, ch, acc):
         path = ch.path or ch.old_path
+        self.touched.update(p for p in (ch.path, ch.old_path) if p)
         if path is None or ch.status == "unknown":
             acc[1] = True
             return
@@ -1157,6 +1217,9 @@ class Selector:
         live = [b for b in blocks if not self.inert(info, b) and not self.pure_duplicate(path, info, b)]
         if not live:
             return
+        # tests that read this file's source text (test_typing parses the typing modules' imports
+        # out of it) see the edit
+        self.charge(acc, self.source_readers.get(path, NO_TESTS))
         if self.source_lines(path, info) is None:
             # no verified pinned source: nothing can be compiled or imported to back a narrow
             # answer, so treat the edit as one that runs when the module is imported

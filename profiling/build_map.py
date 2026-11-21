@@ -863,6 +863,7 @@ def main():
             class_cache[key] = bits
         return class_cache[key]
 
+    component_lines = {}
     out_files = {}
     for rel, ix in files.items():
         kind = ix["kind"]
@@ -1041,6 +1042,16 @@ def main():
                 qs = attr_query_sets(pairs) if sid >= 0 and table.sets[sid] & pq_bit else None
                 # (set, check[, queries of the per-query test, those after planning, steps])
                 cattr[ln] = (sid, check) + (qs if qs is not None else ())
+                if bits == GLOBAL and all(qualname for qualname, _n in entries):
+                    # A class-valued binding (a dialect's Generator, Parser or Tokenizer) is not
+                    # profiled as an attribute; the module's users stand in for its readers once
+                    # module_fb is known (below), with an import check for the class creation.
+                    values = []
+                    for qualname, name in entries:
+                        holder = effects._class("%s.%s" % (module_name(rel), qualname))
+                        values.append(vars(holder).get(name) if holder is not None else None)
+                    if values and all(isinstance(v, type) for v in values):
+                        component_lines.setdefault(rel, []).append(ln)
         for ln, entries in ix["defaults"].items():
             # a default reaches whoever ran the function's body, or, when the default-use
             # profile covers it, whoever called the function without that argument:
@@ -1111,6 +1122,18 @@ def main():
             charged = tests.resolve(ctx)
             for tag in found:
                 data_users[tag] = GLOBAL if charged == GLOBAL or data_users[tag] == GLOBAL else data_users[tag] | charged
+    # Tests that open a sqlglot source file as text from their own code (source inspection, as in
+    # test_typing's walk over the typing modules); the import machinery's own reads do not count.
+    source_readers = defaultdict(int)
+    for ctx, entry in contexts.items():
+        if ctx.startswith(("<import>", "<collect>", "<other>", "<fixture>")):
+            continue
+        charged = tests.resolve(ctx)
+        if charged == GLOBAL:
+            continue
+        for path in entry["reads"]:
+            if path.startswith("sqlglot/") and path.endswith(".py"):
+                source_readers[path] |= charged
     for ctx, entry in contexts.items():
         charged = tests.resolve(ctx)
         for path in entry["reads"]:
@@ -1315,6 +1338,12 @@ def main():
                         break
                     bits |= got
         out_files[rel]["module_fb"] = table.add(bits) if bits != GLOBAL else GLOBAL
+    for rel, lines in component_lines.items():
+        fb = out_files[rel].get("module_fb", GLOBAL)
+        if fb == GLOBAL:
+            continue
+        for ln in lines:
+            out_files[rel]["cattr"][ln] = (fb, True)
 
     blob = {
         "format": FORMAT,
@@ -1323,6 +1352,7 @@ def main():
         "files": out_files,
         "reads": {p: (GLOBAL if b == GLOBAL else table.add(b)) for p, b in openers.items()},
         "class_data": class_data,
+        "source_readers": {p: table.add(b) for p, b in source_readers.items()},
         "scopes": {p: table.add(b) for p, b in scopes.items()},
         # tests that import sqlglot in a fresh interpreter, which the profile cannot see into,
         # and the modules such an "import sqlglot" loads
