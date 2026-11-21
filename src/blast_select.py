@@ -431,6 +431,7 @@ class Selector:
         # [tests, everything, queries of the per-query test, per-query test charged as a whole,
         #  those queries the edit reaches after their plan exists, steps it reaches before that]
         acc = [0, False, set(), False, set(), 0]
+        self.why = None
         self.import_check = set()
         self.touched = set()
         self.unmodeled = set()
@@ -446,12 +447,17 @@ class Selector:
             if not self.imports_cleanly():
                 log("patched modules no longer import:", sorted(self.import_check))
                 if self.import_hung:
-                    acc[1] = True
+                    self._mark(acc, "check")
+                self.why = self.why or ("check" if acc[1] else None)
                 for path in sorted(self.import_check):
+                    self._checking = True
                     self.unimportable(path, self.files.get(path), acc)
+                    self._checking = False
+                if acc[1]:
+                    self.why = self.why or "check"
             elif self.unmodeled:
                 log("import-time edits nothing narrower covers, in", sorted(self.unmodeled), "- running everything")
-                acc[1] = True
+                self._mark(acc, "check")
             if self.core is None or any(_module_of(p) in self.core for p in self.import_check):
                 for index in self.fresh:  # these import sqlglot in a fresh interpreter
                     acc[0] |= 1 << index
@@ -859,13 +865,38 @@ class Selector:
                 self._baseline = []
         return self._baseline
 
+    _checking = False
+
+    def _mark(self, acc, why):
+        self._mark(acc, "file")
+        if self.why is None:
+            self.why = "check" if self._checking else why
+
+    def _charge_label(self):
+        import linecache
+
+        frame = sys._getframe(2)
+        name = frame.f_code.co_name
+        text = linecache.getline(frame.f_code.co_filename, frame.f_lineno)
+        if name == "charge_line":
+            return "line"
+        if name == "python_change":
+            if "hit[0]" in text:
+                return "line"
+            if "source_readers" in text:
+                return "file"
+            return "value"
+        if name in ("unimportable", "module_level"):
+            return "check"
+        return "file"
+
     def charge(self, acc, sid, queries=None, back=None, steps=0):
         """Adds a test set. ``queries`` says which queries of the per-query test the edit can
         reach through this set; without it, that test is charged as a whole. ``back`` says
         which of those it can reach after their plan exists (all of them when not known), and
         ``steps`` in which steps up to the plan (tpcds_check.STEPS; 0 when not known)."""
         if sid == GLOBAL:
-            acc[1] = True
+            self._mark(acc, self._charge_label())
         elif sid >= 0:
             bits = self.sets[sid]
             acc[0] |= bits
@@ -881,11 +912,11 @@ class Selector:
         path = ch.path or ch.old_path
         self.touched.update(p for p in (ch.path, ch.old_path) if p)
         if path is None or ch.status == "unknown":
-            acc[1] = True
+            self._mark(acc, "file")
             return
         base = path.rsplit("/", 1)[-1]
         if base in CONFIG_FILES:
-            acc[1] = True
+            self._mark(acc, "file")
             return
         if path.endswith(".py"):
             info = self.files.get(path)
@@ -897,7 +928,7 @@ class Selector:
                 return
             if info is None:  # a new module nothing imports yet
                 if path.startswith("sqlglot/"):
-                    acc[1] = True
+                    self._mark(acc, "file")
                 return
             self.python_change(path, info, ch.blocks, acc)
             return
@@ -968,11 +999,11 @@ class Selector:
         if path.startswith("tests/"):
             sid = self.scopes.get(path)
             if sid is None:
-                acc[1] = True
+                self._mark(acc, "file")
             else:
                 self.charge(acc, sid)
         elif path.startswith("sqlglot/") or info is None:
-            acc[1] = True
+            self._mark(acc, "file")
         else:
             self.charge(acc, info["users"])
 
