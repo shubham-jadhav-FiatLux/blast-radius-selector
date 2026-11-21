@@ -8,8 +8,9 @@ COPY src/ /app/
 COPY data/map.bin /app/map.bin
 
 # Pinned sqlglot sources (from sqlglot's own repository at the pinned commit) let the selector
-# check that a patched module still compiles. The map itself is committed in data/.
+# check that a patched module still compiles and imports. The map itself is committed in data/.
 RUN python /app/fetch_sources.py "$SQLGLOT_COMMIT" /app/sqlglot-src \
+    && python -S -B /app/import_baseline.py /app/sqlglot-src /app/import_baseline.txt \
     && python -m compileall -q /app/blast_select.py \
     && chmod -R a+rX /app
 

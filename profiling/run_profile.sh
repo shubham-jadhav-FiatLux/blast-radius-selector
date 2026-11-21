@@ -10,7 +10,7 @@ run() {
   local name=$1 memory=$2; shift 2
   docker run --rm --cpus 2 --memory "$memory" --memory-swap "$memory" \
     -v "$src:/src:ro" -v "$plugins:/plugins:ro" -v "$out:/out" \
-    -e PYTHONPATH=/src:/plugins -e PROFILE_OUT="/out/$name.txt.gz" -e OUTCOME_OUT="/out/$name.json" \
+    -e PYTHONPATH=/src:/plugins -e PROFILE_READS=1 -e PROFILE_OUT="/out/$name.txt.gz" -e OUTCOME_OUT="/out/$name.json" \
     -w /src "$image" python -m pytest -q -p trace_plugin -p outcome_plugin -p no:cacheprovider \
     --timeout 900 "$@" > "$out/$name.log" 2>&1
   tail -1 "$out/$name.log"

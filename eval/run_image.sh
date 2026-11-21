@@ -16,6 +16,7 @@ start = time.time()
 import blast_select
 blast_select.main()
 r = resource.getrusage(resource.RUSAGE_SELF)
-print("cpu %.3f s  wall %.3f s  peak %d MB" % (r.ru_utime + r.ru_stime, time.time() - start, r.ru_maxrss // 1024), file=sys.stderr)
+c = resource.getrusage(resource.RUSAGE_CHILDREN)
+print("cpu %.3f s (+%.3f s in subprocesses)  wall %.3f s  peak %d MB" % (r.ru_utime + r.ru_stime, c.ru_utime + c.ru_stime, time.time() - start, r.ru_maxrss // 1024), file=sys.stderr)
 ' > "$output"
 if [ -n "$scorer" ]; then python3 "$scorer" "$sample" "$sample/answers.json" "$output"; fi

@@ -30,6 +30,8 @@ def pytest_collectreport(report):
 
 
 def pytest_sessionfinish(session, exitstatus):
+    if hasattr(session.config, "workerinput"):
+        return  # pytest-xdist worker: the controller receives every report and writes the file
     with open(os.environ.get("OUTCOME_OUT", "outcomes.json"), "w") as f:
         json.dump(
             {

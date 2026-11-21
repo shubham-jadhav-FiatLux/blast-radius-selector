@@ -42,6 +42,45 @@ MAX_WORKERS = 8
 CONFIG_FILES = {"pyproject.toml", "setup.cfg", "tox.ini", "pytest.ini", "conftest.py", ".coveragerc"}
 CODING_RE = re.compile(r"^[ \t\f]*#.*?coding[:=]")
 SIMPLE_VALUE_RE = re.compile(r"True|False|None|[-+]?\d+")
+ASSIGN_TARGET_RE = re.compile(r"^\s*[A-Za-z_]\w*\s*(?::[^=]*)?=(?!=)")
+IMPORT_BASELINE = os.environ.get("BLAST_IMPORT_BASELINE", os.path.join(HERE, "import_baseline.txt"))
+
+# Imports the given sqlglot modules with some files replaced by patched copies, and prints the
+# ones that fail. argv: <pinned sources> <overlay dir> <modules to skip> <modules to import>
+IMPORT_CHECK = r"""
+import importlib, importlib.util, os, sys
+root, overlay = sys.argv[1], sys.argv[2]
+skip = set(filter(None, sys.argv[3].split(",")))
+wanted = list(filter(None, sys.argv[4].split(",")))
+patched = {}
+for base, _dirs, names in os.walk(overlay):
+    for name in names:
+        full = os.path.join(base, name)
+        rel = os.path.relpath(full, overlay)
+        mod = rel[:-3].replace(os.sep, ".")
+        if mod.endswith(".__init__"):
+            patched[mod[:-9]] = (full, [os.path.join(root, os.path.dirname(rel))])
+        else:
+            patched[mod] = (full, None)
+class Overlay:
+    @staticmethod
+    def find_spec(name, path=None, target=None):
+        hit = patched.get(name)
+        if hit is None:
+            return None
+        return importlib.util.spec_from_file_location(name, hit[0], submodule_search_locations=hit[1])
+sys.meta_path.insert(0, Overlay)
+sys.path.insert(0, root)
+failed = []
+for name in ["sqlglot"] + wanted:
+    if name in skip:
+        continue
+    try:
+        importlib.import_module(name)
+    except BaseException:
+        failed.append(name)
+print(",".join(failed))
+"""
 
 
 def log(*parts):
@@ -205,6 +244,11 @@ def changed_columns(old, new):
     return p, len(old) - s, old[p : len(old) - s], new[p : len(new) - s]
 
 
+def _module_of(path):
+    name = path[:-3].replace("/", ".")
+    return name[: -len(".__init__")] if name.endswith(".__init__") else name
+
+
 # ----------------------------------------------------------------------------- selection
 class Selector:
     def __init__(self, blob, sources):
@@ -218,11 +262,61 @@ class Selector:
     # Accumulates either a bitset over map test indices or the GLOBAL marker.
     def run(self, patch_text):
         acc = [0, False]
+        self.import_check = set()
+        self.patched = {}
         for change in parse_patch(patch_text):
             self.file_change(change, acc)
             if acc[1]:
                 break
+        if self.import_check and not acc[1] and not self.imports_cleanly():
+            log("patched modules no longer import:", sorted(self.import_check))
+            acc[1] = True
         return acc
+
+    def imports_cleanly(self):
+        """An edit to an import-time value is charged to the tests that read it, which is only
+        right if every module still imports. Checked in a fresh interpreter over the pinned
+        sources with the patched files laid on top."""
+        if not os.path.isdir(self.sources) or not all(p in self.patched for p in self.import_check):
+            return True  # nothing to check against; keep the map's answer
+        import shutil
+        import subprocess
+        import tempfile
+
+        overlay = tempfile.mkdtemp(prefix="blast-")
+        try:
+            for path, text in self.patched.items():
+                dest = os.path.join(overlay, path)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with open(dest, "w", encoding="utf-8") as f:
+                    f.write(text)
+            wanted = set()
+            for path in self.import_check:
+                wanted.add(_module_of(path))
+                wanted.update(m for m in self.files[path].get("importers", ()) if not m.endswith("__main__"))
+            done = subprocess.run(
+                [
+                    sys.executable, "-S", "-B", "-c", IMPORT_CHECK, self.sources, overlay,
+                    ",".join(self.baseline()), ",".join(sorted(wanted)),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            return done.returncode == 0 and not done.stdout.strip()
+        except Exception as error:  # noqa: BLE001
+            log("import check failed to run:", repr(error))
+            return False
+        finally:
+            shutil.rmtree(overlay, ignore_errors=True)
+
+    def baseline(self):
+        """Modules that already fail to import in this image without any patch."""
+        try:
+            with open(IMPORT_BASELINE) as f:
+                return [m for m in f.read().split(",") if m.strip()]
+        except OSError:
+            return []
 
     def charge(self, acc, sid):
         if sid == GLOBAL:
@@ -325,10 +419,12 @@ class Selector:
             out.extend(b.new)
             pos = b.start + len(b.old)
         out.extend(lines[pos - 1 :])
+        text = "\n".join(out)
         try:
-            compile("\n".join(out), path, "exec", dont_inherit=True)
+            compile(text, path, "exec", dont_inherit=True)
         except (SyntaxError, ValueError):
             return False
+        self.patched[path] = text
         return True
 
     def python_change(self, path, info, blocks, acc):
@@ -354,6 +450,8 @@ class Selector:
                 k = kind[ln - 1]
                 if k == RUNTIME:
                     self.charge(acc, sets.get(ln, NO_TESTS))
+                    if ln in info["checks"]:
+                        self.import_check.add(path)
                     continue
                 cols = None
                 if pairs and b.old:
@@ -362,12 +460,31 @@ class Selector:
                     a, z = cols[0], max(cols[1], cols[0] + 1)
                     if any(c0 <= a and z <= c1 for c0, c1 in info["cols"].get(ln, ())):
                         self.charge(acc, sets.get(ln, NO_TESTS))
+                        if ln in info["checks"]:
+                            self.import_check.add(path)
                         continue
                 if k == DOC and cols is not None and cols[2].count('"') == cols[3].count('"') and cols[2].count("'") == cols[3].count("'"):
                     continue
                 if k == IMPORT and cols is not None and ln in info["argt"]:
                     if SIMPLE_VALUE_RE.fullmatch(cols[2].strip()) and SIMPLE_VALUE_RE.fullmatch(cols[3].strip()):
                         self.charge(acc, info["argt"][ln])
+                        continue
+                if k in (IMPORT, MIXED) and cols is not None and ln in info["dflt"]:
+                    a, z = cols[0], max(cols[1], cols[0] + 1)
+                    hit = [(sid, check) for c0, c1, sid, check in info["dflt"][ln] if c0 <= a and z <= c1]
+                    if hit:
+                        for sid, check in hit:
+                            self.charge(acc, sid)
+                            if check:
+                                self.import_check.add(path)
+                        continue
+                if k == IMPORT and cols is not None and ln in info["cattr"]:
+                    target = ASSIGN_TARGET_RE.match(b.old[i])
+                    if target is None or cols[0] >= target.end():
+                        sid, check = info["cattr"][ln]
+                        self.charge(acc, sid)
+                        if check:
+                            self.import_check.add(path)
                         continue
                 if not b.old and k in (NONE, DOC) and not code_lines(b.new):
                     continue

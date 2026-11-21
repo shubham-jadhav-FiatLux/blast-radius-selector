@@ -71,6 +71,18 @@ class _Indexer:
         self.argtypes: dict[int, list[tuple[str, str]]] = {}
         self.argtypes_classes: dict[str, dict] = {}
         self.module_dicts: dict[int, list[tuple[str, str]]] = {}
+        # line -> [(class qualname, attribute)] for class-level assignments ("" for module level)
+        self.classattr: dict[int, list[tuple[str, str]]] = {}
+        # line -> [(col0, col1, body_start, body_end)] for default values of functions
+        self.defaults: dict[int, list[tuple[int, int, int, int]]] = {}
+        # (scope, names defined, names read) for import-time statements and class-creation hooks
+        self.derivations: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = []
+        # identifier -> lines of runtime statements that mention it
+        self.runtime_names: dict[str, set[int]] = {}
+        self.hook_owner = ""
+        self.pure_lines: set[int] = set()
+        # modules imported while this module is being imported (module and class level)
+        self.imports: set[tuple[int, str, tuple[str, ...]]] = set()
 
     # ------------------------------------------------------------------ marking
     def mark(self, start, end, kind, span, depth):
@@ -115,6 +127,11 @@ class _Indexer:
             for dec in stmt.decorator_list:
                 self.mark_node(dec, here, depth + 1)
             self.mark(span[0], span[1], here, span, depth)
+            if here == IMPORT and not isinstance(stmt, ast.ClassDef):
+                self.note_defaults(stmt)
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and stmt.name in _HOOKS:
+                self.hook_owner = ".".join(qual)
+                self.note_hook(stmt)
             if isinstance(stmt, ast.ClassDef):
                 inner = "func" if scope == "func" else "class"
                 self.visit_body(stmt.body, inner, qual + [stmt.name], depth + 1)
@@ -126,11 +143,23 @@ class _Indexer:
                 self.mark_lambdas_in(stmt.decorator_list, depth)
             return
 
+        if here == IMPORT and isinstance(stmt, ast.Import):
+            for alias in stmt.names:
+                self.imports.add((0, alias.name, ()))
+        elif here == IMPORT and isinstance(stmt, ast.ImportFrom):
+            self.imports.add((stmt.level, stmt.module or "", tuple(a.name for a in stmt.names)))
         # Compound statements keep the scope of their parent for their bodies.
         self.mark(span[0], span[1], here, span, depth)
+        if here == RUNTIME:
+            for part in _header_nodes(stmt):
+                for name in _names_read(part):
+                    self.runtime_names.setdefault(name, set()).update(range(span[0], span[1] + 1))
         if here == IMPORT:
             for part in _header_nodes(stmt):
                 self.mark_lambdas(part, depth)
+            self.note_derivation(stmt, scope, ".".join(qual))
+            if scope in ("class", "module"):
+                self.note_classattr(stmt, ".".join(qual))
         if scope == "module" and isinstance(stmt, ast.Assign):
             self.note_module_dict(stmt)
         for field in ("body", "orelse", "finalbody"):
@@ -185,6 +214,113 @@ class _Indexer:
                 info["expr"] = ast.unparse(value)
             self.argtypes_classes[qualname] = info
 
+    # ------------------------------------------------------------------ class attributes
+    def note_classattr(self, stmt, qualname):
+        names = _target_names(stmt)
+        if not names or not isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            return
+        pure = isinstance(stmt, (ast.Assign, ast.AnnAssign)) and stmt.value is not None and _is_pure(stmt.value)
+        for ln in range(stmt.lineno, (stmt.end_lineno or stmt.lineno) + 1):
+            for name in names:
+                self.classattr.setdefault(ln, []).append((qualname, name))
+            if pure:
+                self.pure_lines.add(ln)
+
+    def note_derivation(self, stmt, scope, qualname):
+        """Import-time statement: which names it (re)defines from which names it reads.
+
+        Reads are kept apart: bare names (class-body names or module globals) and attribute
+        references with their receiver spelled out (``Parser.FUNCTIONS`` -> ("Parser",
+        "FUNCTIONS")), so the map builder can resolve the receiver to the class that owns it."""
+        targets = _target_names(stmt)
+        if not targets:
+            return
+        value = getattr(stmt, "value", None)
+        bare, refs = _reads_split(value) if value is not None else (set(), set())
+        if isinstance(stmt, ast.AugAssign):
+            bare |= set(targets)
+        if bare or refs:
+            self.derivations.append((scope, qualname, tuple(sorted(targets)), tuple(sorted(bare)), tuple(sorted(refs))))
+
+    def note_hook(self, func):
+        """Class-creation hooks (__init_subclass__, metaclass __new__/__init__) derive attributes,
+        e.g. ``cls._KEYWORD_TRIE = new_trie(... cls.KEYWORDS ...)`` or
+        ``klass.ESCAPED_SEQUENCES.setdefault(...)``. Every attribute such a hook assigns or
+        mutates becomes a derivation from the names its value reads, including local variables
+        (transitively) and the conditions the statement sits under."""
+        local_reads: dict[str, set] = {}
+        derived = []
+
+        def plain_names(target):
+            if isinstance(target, ast.Name):
+                return [target.id]
+            if isinstance(target, (ast.Tuple, ast.List)):
+                return [n for elt in target.elts for n in plain_names(elt)]
+            if isinstance(target, ast.Starred):
+                return plain_names(target.value)
+            return []
+
+        def walk(body, guards):
+            for node in body:
+                if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)) and getattr(node, "value", None) is not None:
+                    reads = _names_read(node.value) | guards
+                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                    attrs = set()
+                    for target in targets:
+                        attrs |= {sub.attr for sub in ast.walk(target) if isinstance(sub, ast.Attribute)}
+                        for name in plain_names(target):
+                            local_reads.setdefault(name, set()).update(reads)
+                    if attrs:
+                        derived.append((attrs, reads))
+                elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+                    fn = node.value.func
+                    if isinstance(fn, ast.Attribute) and isinstance(fn.value, (ast.Attribute, ast.Subscript)):
+                        attrs = {sub.attr for sub in ast.walk(fn.value) if isinstance(sub, ast.Attribute)}
+                        if attrs:
+                            derived.append((attrs, _names_read(node.value) | guards))
+                inner = set(guards)
+                if isinstance(node, (ast.If, ast.While)):
+                    inner |= _names_read(node.test)
+                elif isinstance(node, (ast.For, ast.AsyncFor)):
+                    inner |= _names_read(node.iter)
+                    for name in plain_names(node.target):
+                        local_reads.setdefault(name, set()).update(_names_read(node.iter) | guards)
+                elif isinstance(node, (ast.With, ast.AsyncWith)):
+                    for item in node.items:
+                        if item.optional_vars is not None:
+                            for name in plain_names(item.optional_vars):
+                                local_reads.setdefault(name, set()).update(_names_read(item.context_expr))
+                for field in ("body", "orelse", "finalbody"):
+                    sub = getattr(node, field, None)
+                    if isinstance(sub, list) and sub and isinstance(sub[0], ast.stmt):
+                        walk(sub, inner)
+                for handler in getattr(node, "handlers", []) or []:
+                    walk(handler.body, inner)
+
+        walk(func.body, set())
+        for attrs, reads in derived:
+            reads = set(reads)
+            frontier = list(reads)
+            while frontier:
+                for extra in local_reads.get(frontier.pop(), ()):
+                    if extra not in reads:
+                        reads.add(extra)
+                        frontier.append(extra)
+            self.derivations.append(("hook", self.hook_owner, tuple(sorted(attrs)), tuple(sorted(reads)), ()))
+
+    def note_defaults(self, func):
+        args = func.args
+        values = list(args.defaults) + [d for d in args.kw_defaults if d is not None]
+        if not values or not func.body:
+            return
+        b0 = func.body[0].lineno
+        b1 = func.end_lineno or b0
+        for value in values:
+            for ln in range(value.lineno, value.end_lineno + 1):
+                c0 = value.col_offset if ln == value.lineno else 0
+                c1 = value.end_col_offset if ln == value.end_lineno else 1 << 30
+                self.defaults.setdefault(ln, []).append((c0, c1, b0, b1))
+
     def note_module_dict(self, stmt: ast.Assign):
         if len(stmt.targets) != 1 or not isinstance(stmt.targets[0], ast.Name):
             return
@@ -195,6 +331,73 @@ class _Indexer:
             if isinstance(key, ast.Constant) and isinstance(key.value, str):
                 for ln in range(key.lineno, val.end_lineno + 1):
                     self.module_dicts.setdefault(ln, []).append((name, key.value))
+
+
+_HOOKS = {"__init_subclass__", "__new__", "__init__", "__set_name__"}
+
+
+def _target_names(stmt):
+    if isinstance(stmt, ast.Assign):
+        targets = stmt.targets
+    elif isinstance(stmt, (ast.AnnAssign, ast.AugAssign)):
+        targets = [stmt.target]
+    else:
+        return []
+    names = []
+    for target in targets:
+        for sub in ast.walk(target):
+            if isinstance(sub, ast.Name):
+                names.append(sub.id)
+    return names
+
+
+_PURE_NODES = (
+    ast.Constant, ast.Name, ast.Attribute, ast.Dict, ast.List, ast.Tuple, ast.Set, ast.Load,
+    ast.UnaryOp, ast.USub, ast.UAdd, ast.Not, ast.Starred,
+)
+
+
+def _is_pure(node):
+    """A literal display of constants and names: evaluating it cannot raise or run code
+    (attribute lookups on sqlglot classes and modules are plain reads)."""
+    return all(isinstance(sub, _PURE_NODES) for sub in ast.walk(node))
+
+
+def _dotted(node):
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+        return ".".join(reversed(parts))
+    return None
+
+
+def _reads_split(node):
+    """(bare names, {(receiver or "", attribute)}) mentioned by an expression."""
+    bare, refs = set(), set()
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Name):
+            bare.add(sub.id)
+        elif isinstance(sub, ast.Attribute):
+            refs.add((_dotted(sub.value) or "", sub.attr))
+        elif isinstance(sub, ast.Constant) and isinstance(sub.value, str) and sub.value.isidentifier():
+            refs.add(("", sub.value))  # getattr(obj, "NAME")
+    return bare, refs
+
+
+def _names_read(node):
+    """Every bare name and attribute name an expression mentions."""
+    out = set()
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Name):
+            out.add(sub.id)
+        elif isinstance(sub, ast.Attribute):
+            out.add(sub.attr)
+        elif isinstance(sub, ast.Constant) and isinstance(sub.value, str) and sub.value.isidentifier():
+            out.add(sub.value)  # getattr(cls, "NAME")
+    return out
 
 
 def _header_nodes(stmt):
@@ -263,4 +466,10 @@ def index_source(source: str) -> dict:
         "argtypes": ix.argtypes,
         "argtypes_classes": ix.argtypes_classes,
         "module_dicts": ix.module_dicts,
+        "classattr": ix.classattr,
+        "defaults": ix.defaults,
+        "derivations": ix.derivations,
+        "runtime_names": {k: sorted(v) for k, v in ix.runtime_names.items()},
+        "imports": sorted(ix.imports),
+        "pure": sorted(ix.pure_lines),
     }

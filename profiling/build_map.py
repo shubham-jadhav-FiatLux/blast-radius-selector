@@ -24,6 +24,7 @@ from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from import_effects import MODULE, ImportEffects, module_name  # noqa: E402
 from source_index import DOC, IMPORT, MIXED, NONE, RUNTIME, index_source  # noqa: E402
 
 NO_TESTS = -1
@@ -34,9 +35,14 @@ SOURCE_DIRS = ("sqlglot/", "tests/", "sqlglotc/")
 
 
 # ----------------------------------------------------------------------------- profile
-def read_profile(paths):
-    """ctx -> {"lines": {(rel, signed line)}, "reads": {path}, "missing": {(class, arg)}}"""
-    contexts = defaultdict(lambda: {"lines": set(), "reads": set(), "missing": set()})
+def read_profile(paths, meta=None):
+    """ctx -> {"lines": {(rel, signed line)}, "reads": {path}, "missing": {(class, arg)},
+    "attrs": {"owner:attr"}}. Class metadata (A and K records) goes into ``meta``."""
+    contexts = defaultdict(lambda: {"lines": set(), "reads": set(), "missing": set(), "attrs": set()})
+    if meta is None:
+        meta = {}
+    meta.setdefault("instrumented", set())
+    meta.setdefault("families", {})
     for path in paths:
         files = {}
         records = []
@@ -49,6 +55,22 @@ def read_profile(paths):
                 else:
                     records.append((kind, rest))
         for kind, rest in records:
+            if kind == "A":
+                owner, _, names = rest.partition("\t")
+                meta["instrumented"].update((owner, n) for n in names.split(",") if n)
+                continue
+            if kind == "I":
+                where, _, origins = rest.partition("\t")
+                fid, line = where.split(":")
+                dest = meta.setdefault("origins", {}).setdefault((files[int(fid)], int(line)), set())
+                for item in origins.split(","):
+                    ofid, oline = item.split(":")
+                    dest.add((files[int(ofid)], int(oline)))
+                continue
+            if kind == "K":
+                key, mro, parts = (rest.split("\t") + ["", ""])[:3]
+                meta["families"][key] = (tuple(m for m in mro.split("|") if m), tuple(p for p in parts.split("|") if p))
+                continue
             ctx, _, payload = rest.partition("\t")
             entry = contexts[ctx]
             if kind == "C" and payload:
@@ -61,6 +83,8 @@ def read_profile(paths):
                 for item in payload.split(","):
                     cls, _, arg = item.rpartition(":")
                     entry["missing"].add((cls, arg))
+            elif kind == "R" and payload:
+                entry["attrs"].update(payload.split(","))
     return contexts
 
 
@@ -276,7 +300,8 @@ def main():
     if failed:
         print("build_map: %d tests failed during profiling: %s" % (len(failed), failed[:5]), file=sys.stderr)
     tests = Tests(order)
-    contexts = read_profile(args.profile)
+    meta = {}
+    contexts = read_profile(args.profile, meta)
     table = SetTable()
 
     # line -> tests (function code only), and lines run by function code in GLOBAL contexts
@@ -344,25 +369,105 @@ def main():
                     stack.append(child)
         return seen
 
+    # ------------------------------------------------------------- import-time effects
+    attr_reads = defaultdict(int)
+    attr_global = set()
+    for ctx, entry in contexts.items():
+        charged = tests.resolve(ctx)
+        for tag in entry["attrs"]:
+            if charged == GLOBAL:
+                attr_global.add(tag)
+            else:
+                attr_reads[tag] |= charged
+
+    mentions = defaultdict(list)
+    for rel, ix in files.items():
+        for name, lines in ix["runtime_names"].items():
+            mentions[name].append((rel, lines))
+    name_cache = {}
+    origins = meta.get("origins", {})
+    eff_cache = {}
+    eff_active = set()
+    via_import = set()
+
+    def eff(rel, ln):
+        """Tests an edit to function line ``ln`` can reach: the tests that ran it, plus, when
+        it also ran while sqlglot was being imported, the readers of every class attribute or
+        module global it helped compute then (sqlglot parses SQL templates and builds tables
+        at import time). GLOBAL when that import-time role cannot be traced."""
+        key = (rel, ln)
+        if key in eff_cache:
+            return eff_cache[key]
+        if key in eff_active:
+            return GLOBAL
+        eff_active.add(key)
+        bits = cov.get(key, 0)
+        if key in global_func:
+            via_import.add(key)
+            found = origins.get(key)
+            if not found:
+                bits = GLOBAL
+            for orel, oline in found or ():
+                entries = files[orel]["classattr"].get(oline) if orel in files and orel.startswith("sqlglot/") else None
+                if not entries:
+                    bits = GLOBAL
+                    break
+                for qualname, name in entries:
+                    owner = "%s.%s" % (module_name(orel), qualname) if qualname else MODULE
+                    got = effects.tests_for(owner, name)
+                    if got == GLOBAL:
+                        bits = GLOBAL
+                        break
+                    bits |= got
+                if bits == GLOBAL:
+                    break
+        eff_active.discard(key)
+        eff_cache[key] = bits
+        return bits
+
+    def union_eff(rel, lines):
+        bits = 0
+        for ln in lines:
+            got = eff(rel, ln)
+            if got == GLOBAL:
+                return GLOBAL
+            bits |= got
+        return bits
+
+    def name_cov(name):
+        """Tests that ran a statement mentioning ``name`` (readers of a module global)."""
+        if name not in name_cache:
+            name_cache[name] = GLOBAL  # guards against cycles while it is being computed
+            bits = 0
+            for rel, lines in mentions.get(name, ()):
+                got = union_eff(rel, lines)
+                if got == GLOBAL:
+                    bits = GLOBAL
+                    break
+                bits |= got
+            name_cache[name] = bits
+        return name_cache[name]
+
+    effects = ImportEffects(files, meta["families"], meta["instrumented"], attr_reads, attr_global, name_cov)
+    if not meta["families"]:
+        print("build_map: profile has no class records; import-time edits will run everything", file=sys.stderr)
+
     out_files = {}
     for rel, ix in files.items():
         kind = ix["kind"]
         spans = ix["spans"]
         sets = {}
+        checks = []
         for ln in range(1, ix["n"] + 1):
             k = kind[ln - 1]
             if k not in (RUNTIME, MIXED):
                 continue
             a, b = spans[ln - 1]
-            bits = 0
-            glob = False
-            for l2 in range(a, b + 1):
-                bits |= cov.get((rel, l2), 0)
-                if (rel, l2) in global_func:
-                    glob = True
-            sid = GLOBAL if glob else table.add(bits)
+            sid = table.add(union_eff(rel, range(a, b + 1)))
             if sid != NO_TESTS:
                 sets[ln] = sid
+            if any((rel, l2) in via_import for l2 in range(a, b + 1)):
+                checks.append(ln)  # the edited code also ran at import time; it could now fail there
 
         argt = {}
         for ln, entries in ix["argtypes"].items():
@@ -383,6 +488,31 @@ def main():
                         bits |= m
             argt[ln] = GLOBAL if glob else table.add(bits)
 
+        cattr = {}
+        dflt = {}
+        if rel.startswith("sqlglot/") and meta["families"]:
+            pure = set(ix["pure"])
+            for ln, entries in ix["classattr"].items():
+                bits = 0
+                check = ln not in pure
+                for qualname, name in entries:
+                    owner = "%s.%s" % (module_name(rel), qualname) if qualname else MODULE
+                    got = effects.tests_for(owner, name)
+                    if got == GLOBAL:
+                        bits = GLOBAL
+                        break
+                    bits |= got
+                    # import-time code that derives from the value could fail on the new value
+                    if len(effects.affected(owner, name)) > 1:
+                        check = True
+                cattr[ln] = (table.add(bits), check)
+        for ln, entries in ix["defaults"].items():
+            dflt[ln] = [
+                (c0, c1, table.add(union_eff(rel, range(b0, b1 + 1))),
+                 any((rel, l2) in via_import for l2 in range(b0, b1 + 1)))
+                for c0, c1, b0, b1 in entries
+            ]
+
         users = module_users.get(rel, 0)
         out_files[rel] = {
             "kind": kind,
@@ -390,6 +520,9 @@ def main():
             "sets": sets,
             "cols": ix["runtime_cols"],
             "argt": argt,
+            "cattr": cattr,
+            "dflt": dflt,
+            "checks": set(checks),
             "users": GLOBAL if users == GLOBAL else table.add(users),
             "sha1": digests[rel],
         }
@@ -406,6 +539,34 @@ def main():
                 openers[path] |= charged
 
     scopes = test_module_scopes(src, tests)
+
+    # Which sqlglot modules import each module while being imported, so the selector's import
+    # check only has to load the patched modules and their importers.
+    modules = {module_name(rel): rel for rel in files if rel.startswith("sqlglot/")}
+    importers = defaultdict(set)
+    for rel in modules.values():
+        me = module_name(rel)
+        package = me if rel.endswith("__init__.py") else me.rpartition(".")[0]
+        for level, mod, names in files[rel]["imports"]:
+            if level:
+                base = package
+                for _ in range(level - 1):
+                    base = base.rpartition(".")[0]
+                mod = base + ("." + mod if mod else "")
+            targets = [mod] + [mod + "." + n for n in names]
+            for target in targets:
+                while target:
+                    if target in modules and target != me:
+                        importers[target].add(me)
+                    target = target.rpartition(".")[0]
+    for rel in modules.values():
+        seen, stack = set(), [module_name(rel)]
+        while stack:
+            for imp in importers[stack.pop()]:
+                if imp not in seen:
+                    seen.add(imp)
+                    stack.append(imp)
+        out_files[rel]["importers"] = sorted(seen)
 
     blob = {
         "format": FORMAT,
