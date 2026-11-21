@@ -1,7 +1,7 @@
 """Weak mutation profiling: which tests would see a comparison come out differently.
 
 A test can only fail on a mutant if the mutated code computes something different for it. For
-comparison and boolean operator swaps that is cheap to observe directly: while profiling, every
+comparison and boolean operator swaps (and dropped ``not``s) that is cheap to observe directly: while profiling, every
 ``a < b`` inside a sqlglot function is rewritten into a call that evaluates ``a < b`` (the
 result the program uses) and also the swapped operators (``a <= b``), and notes whether any of
 them would have come out differently in the current context. Same for ``a is b`` against
@@ -149,6 +149,22 @@ class _Rewriter(ast.NodeTransformer):
         )
         return ast.copy_location(call, node)
 
+    def visit_UnaryOp(self, node):
+        """``not x``: dropping the ``not`` changes the result every time it is evaluated, so
+        the site only has to record that it ran (finer than the line: ``a and not b`` may
+        stop before ``not b``)."""
+        self.generic_visit(node)
+        if self.depth == 0 or not isinstance(node.op, ast.Not):
+            return node
+        line = self.lines[node.lineno - 1]
+        if line[node.col_offset : node.col_offset + 4] != "not ":
+            return node
+        site = len(SITES)
+        SITES.append((self.rel, node.lineno, node.col_offset, node.col_offset + 4, "not ", [""]))
+        _DETAIL.append((True, None, "not"))
+        call = ast.Call(func=ast.Name(id="__weak_not__", ctx=ast.Load()), args=[ast.Constant(site), node.operand], keywords=[])
+        return ast.copy_location(call, node)
+
     def visit_BoolOp(self, node):
         self.generic_visit(node)
         if self.depth == 0 or len(node.values) != 2 or id(node) not in self.bool_nodes:
@@ -245,6 +261,12 @@ def install(current):
             current().add(site * 4)
         return value
 
+    def weak_not(site, value):
+        result = not value
+        current().add(site * 4)
+        return result
+
     builtins.__weak_cmp__ = weak_cmp
+    builtins.__weak_not__ = weak_not
     builtins.__weak_left__ = weak_left
     builtins.__weak_right__ = weak_right

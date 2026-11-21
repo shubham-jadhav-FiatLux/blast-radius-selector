@@ -548,12 +548,10 @@ def main():
                 openers[path] |= charged
 
     # ------------------------------------------------------------- weak mutation sites
+    # Each weak run numbers its sites itself, so runs are merged by what a site is (file,
+    # line, columns, text) rather than by its number. Every run covers the whole suite.
     weak_sites = 0
     if args.weak:
-        wmeta = {}
-        wcontexts = read_profile(args.weak, wmeta)
-        sites = wmeta.get("sites", [])
-        # Tests the weak runs did not cover (or that failed there) keep their plain coverage.
         weak_ran, weak_failed = read_outcomes(args.weak_outcomes) if args.weak_outcomes else ([], [])
         unprofiled = 0
         trusted = set(weak_ran) - set(weak_failed)
@@ -562,30 +560,42 @@ def main():
                 unprofiled |= 1 << i
         if unprofiled:
             print("build_map: %d tests have no weak profile; they keep plain coverage" % bin(unprofiled).count("1"), file=sys.stderr)
-        infected = defaultdict(int)
-        for ctx, entry in wcontexts.items():
-            codes = entry.get("weak")
-            if not codes:
+        infected = defaultdict(int)  # (rel, ln, c0, c1, text, variant) -> bits or GLOBAL
+        known = set()
+        for path in args.weak:
+            wmeta = {}
+            wcontexts = read_profile([path], wmeta)
+            sites = wmeta.get("sites", [])
+            for rel, ln, c0, c1, text, variants in sites:
+                for vtext in variants:
+                    known.add((rel, ln, c0, c1, text, vtext))
+            for ctx, entry in wcontexts.items():
+                codes = entry.get("weak")
+                if not codes:
+                    continue
+                charged = tests.resolve(ctx)
+                for code in codes:
+                    site, index = divmod(code, 4)
+                    rel, ln, c0, c1, text, variants = sites[site]
+                    key = (rel, ln, c0, c1, text, variants[index])
+                    if charged == GLOBAL or infected[key] == GLOBAL:
+                        infected[key] = GLOBAL
+                    else:
+                        infected[key] |= charged
+        by_site = defaultdict(list)
+        for key in sorted(known):
+            rel, ln, c0, c1, text, vtext = key
+            if c0 < 0 or rel not in out_files:
                 continue
-            charged = tests.resolve(ctx)
-            for code in codes:
-                if charged == GLOBAL or infected[code] == GLOBAL:
-                    infected[code] = GLOBAL
-                else:
-                    infected[code] |= charged
-        for site, (rel, ln, c0, c1, text, variants) in enumerate(sites):
-            if c0 < 0 or rel not in out_files or not variants:
-                continue
-            usable = []
+            bits = infected.get(key, 0)
+            if bits == GLOBAL:
+                continue  # it would differ while sqlglot is being imported: no shortcut
             fallback = cov.get((rel, ln), 0) & unprofiled
-            for index, vtext in enumerate(variants):
-                bits = infected.get(site * 4 + index, 0)
-                if bits == GLOBAL:
-                    continue  # it would differ while sqlglot is being imported: no shortcut
-                usable.append((vtext, table.add(bits | fallback)))
-            if usable:
-                out_files[rel].setdefault("weak", {}).setdefault(ln, []).append((c0, c1, text.strip(), usable))
-                weak_sites += 1
+            by_site[(rel, ln, c0, c1, text)].append((vtext, table.add(bits | fallback)))
+        for (rel, ln, c0, c1, text), usable in by_site.items():
+            shown = text if len(text) == c1 - c0 else text.strip()  # the exact source text at c0..c1
+            out_files[rel].setdefault("weak", {}).setdefault(ln, []).append((c0, c1, shown, usable))
+            weak_sites += 1
     for info in out_files.values():
         info.setdefault("weak", {})
 

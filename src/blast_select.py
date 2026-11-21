@@ -384,16 +384,21 @@ class Selector:
         if not self._warm:
             self._warm = True
             sys.path.insert(0, self.sources)
+            stdout, sys.stdout = sys.stdout, sys.stderr  # stdout carries the answers only
             try:
                 import sqlglot  # noqa: F401
             except Exception:  # noqa: BLE001
                 return False
+            finally:
+                sys.stdout = stdout
         sys.stdout.flush()
         sys.stderr.flush()
         pid = os.fork()
         if pid == 0:
             status = 1
             try:
+                os.dup2(os.open(os.devnull, os.O_WRONLY), 1)
+                sys.stdout = sys.stderr
                 import importlib
 
                 scope = {_module_of(p) for p in self.patched} | wanted
@@ -522,6 +527,29 @@ class Selector:
         return code_lines(b.old) == code_lines(b.new)
 
     @staticmethod
+    def whole_entry_edit(info, b):
+        """True if a block only adds or removes whole lines strictly inside one class or module
+        level assignment (entries of a table, not its first line), so the change is a change to
+        that one attribute's value."""
+        cattr = info["cattr"]
+        if b.old:
+            lines = range(b.start, b.start + len(b.old))
+            neighbours = (b.start - 1, b.start + len(b.old))
+        else:
+            lines = ()
+            neighbours = (b.start - 1, b.start)
+        owners = set()
+        for ln in list(lines) + list(neighbours):
+            entry = cattr.get(ln)
+            if entry is None or entry[0] == GLOBAL:
+                return False
+            owners.add(entry[0])
+        if len(owners) != 1:
+            return False
+        texts = list(b.old) + list(b.new)
+        return not any(ASSIGN_TARGET_RE.match(t) for t in texts)
+
+    @staticmethod
     def weak_match(sites, old, new):
         """If the edit swaps exactly one profiled operator or constant, the tests that would
         have seen that swap change a result (from the weak mutation profile)."""
@@ -648,6 +676,12 @@ class Selector:
                             self.import_check.add(path)
                         continue
                 if not b.old and k in (NONE, DOC) and not code_lines(b.new):
+                    continue
+                if not pairs and k in (IMPORT, MIXED) and self.whole_entry_edit(info, b):
+                    # whole lines added to or removed from the middle of a class-level table
+                    sid, _check = info["cattr"][ln]
+                    self.charge(acc, sid)
+                    self.import_check.add(path)
                     continue
                 self.module_level(path, info, acc)
             if acc[1]:

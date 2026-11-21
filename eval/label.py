@@ -44,20 +44,28 @@ def apply(tree, patch_text):
     return saved
 
 
-def run_suite(tree, out_dir, image, jobs):
+def run_suite(tree, out_dir, image, jobs, targets=("tests",)):
     out = os.path.join(out_dir, "outcomes.json")
     if os.path.exists(out):
         os.remove(out)
+    parallel = ["-n", str(jobs)] if jobs > 1 else ["-p", "no:xdist"]
     cmd = [
-        "docker", "run", "--rm", "--cpus", str(jobs), "--memory", "5g", "--memory-swap", "5g",
+        "docker", "run", "--rm", "--cpus", str(max(jobs, 2)), "--memory", "5g", "--memory-swap", "5g",
         "-v", "%s:/src:ro" % tree, "-v", "%s:/plugins:ro" % PLUGINS, "-v", "%s:/out" % out_dir,
         "-e", "PYTHONPATH=/src:/plugins", "-e", "OUTCOME_OUT=/out/outcomes.json", "-w", "/src", image,
         "python", "-m", "pytest", "-q", "-p", "outcome_plugin", "-p", "no:cacheprovider",
-        "-n", str(jobs), "--timeout", "600", "tests",
+        *parallel, "--timeout", "600", *targets,
     ]
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3600)
     with open(out) as f:
         return json.load(f)
+
+
+def failing_ids(result, by_file_ids):
+    failed = {n for n, r in result["results"].items() if r["failed"]}
+    for nodeid in result["collect_errors"]:
+        failed.update(by_file_ids.get(nodeid.split("::")[0], []))
+    return failed
 
 
 def main():
@@ -72,9 +80,9 @@ def main():
 
     tests = json.load(open(args.tests))["tests"]
     number = {t["id"]: t["number"] for t in tests}
-    by_file = {}
+    by_file_ids = {}
     for t in tests:
-        by_file.setdefault(t["file"], []).append(t["number"])
+        by_file_ids.setdefault(t["file"], []).append(t["id"])
     labels = {"commits": {}}
     if os.path.exists(args.labels):
         labels = json.load(open(args.labels))
@@ -99,18 +107,28 @@ def main():
             saved = apply(tree, text)
             try:
                 result = run_suite(tree, out_dir, args.image, args.jobs)
+                failed = failing_ids(result, by_file_ids)
+                # A parallel run on a busy machine can lose a worker (process pools, memory);
+                # a failure only counts if it happens again with the failing tests run alone.
+                unconfirmed = set()
+                if failed and len(failed) <= 200:
+                    again = run_suite(tree, out_dir, args.image, 1, sorted(failed))
+                    confirmed = failing_ids(again, by_file_ids)
+                    unconfirmed = failed - confirmed
+                    failed = confirmed
             finally:
                 for path, original in saved.items():
                     with open(path, "w", encoding="utf-8") as f:
                         f.write(original)
-            failing = {number[n] for n, r in result["results"].items() if r["failed"] and n in number}
-            for nodeid in result["collect_errors"]:
-                failing.update(by_file.get(nodeid.split("::")[0], []))
+            failing = {number[n] for n in failed if n in number}
             kind = manifest.get(cid, {}).get("kind", "code")
             labels["commits"][cid] = {"failing": sorted(failing), "kind": kind}
+            if unconfirmed:
+                labels["commits"][cid]["unconfirmed"] = sorted(number[n] for n in unconfirmed if n in number)
             with open(args.labels, "w") as f:
                 json.dump(labels, f)
-            print("%s %-8s %4d failing  %s" % (cid, kind, len(failing), manifest.get(cid, {}).get("file", "")), flush=True)
+            print("%s %-8s %4d failing (%d unconfirmed)  %s" % (
+                cid, kind, len(failing), len(unconfirmed), manifest.get(cid, {}).get("file", "")), flush=True)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 

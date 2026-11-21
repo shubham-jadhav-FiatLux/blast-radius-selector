@@ -29,8 +29,10 @@ labelled its commits in (`profiling/`):
    edits. Every comparison and condition inside a sqlglot function is rewritten so that it
    evaluates the swapped form next to the real one: `a <= b` next to `a < b`, `a == b` next to
    `a is b`, `n + 1` and `n - 1` next to a constant `n`, and `x or y` next to `x and y` where
-   only the truth value is used. The pass records, per test, which swaps would have produced
-   a different result. The program still sees only the original results, and all 1,620 tests
+   only the truth value is used. Each `not` records whether it was evaluated at all, because
+   `a and not b` can stop before it. The pass records, per test, which swaps would have
+   produced a different result. It runs under several hash seeds, and the runs are merged by
+   site. The program still sees only the original results, and all 1,620 tests
    still pass under the rewrite.
 
    A few details make the attribution trustworthy:
@@ -62,11 +64,11 @@ edited block:
 | Edit | Tests charged |
 | --- | --- |
 | comment or blank line outside a string literal (Python files only) | none |
-| a comparison, constant in a comparison, or condition swapped for one the weak pass observed | the tests in which that swap would have changed a result; an `is` that can never differ from `==` for the values actually seen costs nothing |
+| a comparison, constant in a comparison, condition or `not` swapped for one the weak pass observed | the tests in which that swap would have changed a result; an `is` that can never differ from `==` for the values actually seen costs nothing |
 | any other edit inside a function body | every test that ran any line of the enclosing statement (with `and`/`or` short-circuiting, a test can depend on a statement without running the edited line), plus the readers of anything that code computed while sqlglot was being imported |
 | inside a lambda that an import-time table holds | the tests that called it |
 | `arg_types` flag flipped | tests that validated a node of an affected class while that argument was missing (`arg_types` values only feed `required_args`); affected classes are the class itself, its subclasses, and classes splicing in its dict |
-| other class attribute or module constant | tests that read it, or anything derived from it, on the defining class, its subclasses, or the dialects built from them; `{**Parser.FUNCTIONS}` resolves to `Parser`, not to whichever parser happens to be nearby |
+| other class attribute or module constant (including whole entries added to or removed from a table) | tests that read it, or anything derived from it, on the defining class, its subclasses, or the dialects built from them; `{**Parser.FUNCTIONS}` resolves to `Parser`, not to whichever parser happens to be nearby |
 | default value of a function argument | tests that ran the function |
 | module level code in `tests/` | tests in that module and in every module importing it |
 | data file (SQL fixtures) | the tests that opened it |
@@ -87,7 +89,12 @@ for the whole batch. For comparison, running everything costs 1,104 s, and an or
 failing tests costs 94.4 s.
 
 `eval/mutants.py` generates synthetic edits with the same operators, and `eval/label.py` labels
-them by running the full suite on each, which gives a test bed far beyond the 30 samples.
+them by running the full suite on each, which gives a test bed far beyond the 30 samples. A
+failure counts only if it happens again when the failing tests are re-run alone, because a
+parallel run on a loaded machine can lose a process-pool worker. `eval/check_labels.py` scores
+a selector output against those labels.
+
+`tests/` holds unit tests for the selector's building blocks: `python -m unittest discover tests`.
 
 ## Running it
 
