@@ -40,6 +40,7 @@ WORKER_MS = 2000
 MAX_WORKERS = 8
 PER_QUERY_BUDGET = 16.0  # most seconds of re-checking ever worth trying instead of a 21 s test
 CHILD_SECONDS = 20.0  # longest any single patched child may run before it is killed
+IMPORT_SECONDS = 8.0  # an import check normally takes well under a second
 TOTAL_CHILD_SECONDS = 100.0  # all patched children together, for the whole batch
 
 CONFIG_FILES = {"pyproject.toml", "setup.cfg", "tox.ini", "pytest.ini", "conftest.py", ".coveragerc"}
@@ -492,7 +493,7 @@ class Selector:
                 with open(dest, "w", encoding="utf-8") as f:
                     f.write(text)
             try:
-                if hasattr(os, "fork") and self.forked_check(overlay, wanted):
+                if hasattr(os, "fork") and self.forked_check(overlay, wanted, timeout=IMPORT_SECONDS):
                     return True
             except TimeoutError:
                 return False  # an import that hangs breaks every importer
