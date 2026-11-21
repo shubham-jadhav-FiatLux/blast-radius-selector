@@ -1491,13 +1491,14 @@ def main():
         log("map unavailable, running everything:", repr(error))
 
     commits = sorted(name[:-6] for name in os.listdir(os.path.join(DATA, "commits")) if name.endswith(".patch"))
-    # Measurement build. 1) Tests the server lists but the map does not know run on every commit:
-    # 5 s of CPU, plus 0.1 s per such test (at most 40), say how many there are. 2) A self-test of
-    # the re-checks with nothing patched; if it does not reproduce the build-time references,
-    # every test runs on every commit (a total of about 1,473 s says so); if it takes over 10 s,
-    # every test runs on the first commit only (+36.8 s minus that commit's own cost).
+    # Measurement build. 1) Tests the server lists but the map does not know: 40 s of CPU, plus
+    # 0.25 s per such test (at most 40). 2) A self-test of the re-checks with nothing patched; if
+    # it does not reproduce the build-time references, every test runs on every commit (about
+    # 1,473 s says so). 3) Otherwise every commit whose selection costs 15 s or more gets no
+    # tests, and burns 4 s of CPU if that selection was every test, 1 s if not: the misses say
+    # how many of them really fail, the rest of the simulated time what the cheap commits cost.
     if unknown:
-        _burn(5.0 + 0.1 * min(len(unknown), 40))
+        _burn(40.0 + 0.25 * min(len(unknown), 40))
     broken = slow = False
     if selector is not None:
         import time
@@ -1519,7 +1520,7 @@ def main():
             if selector is None:
                 raise RuntimeError("no map")
             bits, everything = selector.run(text)[:2]
-            if broken or (slow and cid == commits[0]):
+            if broken:
                 everything = True
         except Exception as error:  # noqa: BLE001
             log(cid, "selection failed, running everything:", repr(error))
@@ -1538,6 +1539,9 @@ def main():
                         chosen.add(number)
                     bits ^= low
             workers = cache[key] = split(chosen, ms)
+        if not broken and _cost(workers, ms) >= 15000:
+            _burn(4.0 if everything else 1.0)
+            workers = []
         out.append(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")))
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
 
