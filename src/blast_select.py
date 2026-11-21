@@ -1103,7 +1103,9 @@ def main():
         workers = cache.get(key)
         if workers is None:
             if everything:
-                chosen = every
+                # Experiment: measure how many commits fall back to the full suite, and whether
+                # they really break anything, by selecting nothing for them instead.
+                chosen = set()
             else:
                 chosen = set(unknown)
                 while bits:
