@@ -9,7 +9,7 @@ docker run --rm --platform linux/amd64 --network none --cpus 2 \
   --security-opt no-new-privileges --user 65534:65534 --env HOME=/tmp \
   --volume "$sample/commits:/data/commits:ro" \
   --volume "$sample/tests.json:/data/tests.json:ro" \
-  --cpuset-cpus 0-1 "$image" python -S -B -c '
+  --cpuset-cpus 0-1 ${BLAST_ENV:+--env $BLAST_ENV} "$image" python -S -B -c '
 import resource, sys, time
 sys.path.insert(0, "/app")
 start = time.time()

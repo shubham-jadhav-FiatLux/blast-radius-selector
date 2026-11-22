@@ -55,6 +55,12 @@ PER_QUERY_BUDGET = 16.0  # most seconds of re-checking ever worth trying instead
 RECHECK_RATIO = 0.5
 RECHECK_SHARE = 0.8
 TEXT_QUERY_MAX = 6  # most TPC-DS queries with a changed fixture text that are re-checked by it
+# A long test whose re-check costs about what leaving it out saves is left out when the tests
+# close to it pass here (same class, or readers of its fixture) and its plans are the pinned ones:
+# a long test practically never fails without one of those (see long_test_evidence).
+EVIDENCE_SAVING = 12.0  # seconds leaving it (and those tests) out must save
+EVIDENCE_SECONDS = 25.0  # the child running those tests
+PQ_CLASS = "tests/test_executor.py::TestExecutor::"
 # Lines of sqlglot.executor.execute() that test_execute_tpcds never runs: the schema inference
 # under `if not schema:` (the test always hands its workers TPCDS_SCHEMA) and the raise of the
 # table-args check. The TPC-DS stage profile counts every line of execute() for every query, so
@@ -611,6 +617,7 @@ class Selector:
         self.fixture_queries = None  # {query: (meta, sql)} whose text an edit of tpc-ds.sql changed
         self.other_bits = 0  # tests charged any other way
         self._strip_pq = False  # charging lines the per-query test never runs (PQ_NEVER_RUN)
+        self.pq_refused = False  # the per-query re-check was refused for what it would cost
         self._line_path = None
         self.import_check = set()
         self.touched = set()
@@ -673,7 +680,152 @@ class Selector:
                     acc[0] &= ~self.pq_bit
                 else:
                     log("per-query test reached as a whole: kept")
+            else:
+                self.pq_refused = True
+        if not acc[1] and acc[0] & self.pq_bit and self.pq_refused:
+            self.long_test_evidence(acc)
         return acc
+
+    def long_test_evidence(self, acc):
+        """When re-checking the per-query test costs about what leaving it out saves: leaves it
+        out if the tests close to it that the commit reaches (the other tests of its class, and the
+        tests reading its fixture) all pass here, run on the patched sources, and every executed
+        TPC-DS query still plans exactly as at the pinned commit (a slower or different plan, as a
+        changed optimizer flag gives, is not left to evidence). On labeled mutants a long test
+        practically never fails without one of the tests close to it. Only for edits to sqlglot's
+        Python files, and only when the fixtures that class loads are in the image."""
+        if not self.changed or any(not (p.startswith("sqlglot/") and p.endswith(".py")) for p in self.touched):
+            return False
+        if self.plans is None or not os.path.exists(os.path.join(self.sources, "tests", "fixtures", ".fixtures-complete")):
+            return False
+        fx_sid = self.reads.get(EXECUTOR_FIXTURES[0], NO_TESTS)
+        fx_bits = self.sets[fx_sid] if fx_sid >= 0 else 0
+        close = {}
+        rest = acc[0] & ~self.pq_bit
+        while rest:
+            low = rest & -rest
+            i = low.bit_length() - 1
+            rest ^= low
+            if i >= len(self.test_ids) or i >= len(self.index_to_number) or self.index_to_number[i] < 0:
+                continue
+            tid = self.test_ids[i]
+            parts = tid.split("::")
+            if len(parts) == 3 and parts[0].endswith(".py") and (tid.startswith(PQ_CLASS) or fx_bits & low):
+                close[i] = "%s.%s.%s" % (parts[0][:-3].replace("/", "."), parts[1], parts[2])
+        if not close:
+            return False  # nothing close to it to go by
+        drop = self.pq_bit | sum(1 << i for i in close)
+        saving = self.saving_without(acc[0], drop)
+        if saving < EVIDENCE_SAVING or TOTAL_CHILD_SECONDS - self.child_seconds < EVIDENCE_SECONDS + RERUN_SPARE:
+            return False
+        got = self.run_tests_here(close.values(), EVIDENCE_SECONDS)
+        if got is None:
+            return False
+        bad, ran = got
+        if bad or not set(close.values()) <= ran:
+            log("per-query test kept: %d of the %d tests close to it fail or did not run here" % (
+                len(bad | (set(close.values()) - ran)), len(close)))
+            return False
+        if not self.plans_unchanged():
+            log("per-query test kept: a TPC-DS query plans differently")
+            return False
+        acc[0] &= ~drop
+        log("per-query test left out: re-checking it costs about what it saves, the %d tests close to it "
+            "pass here, and every executed TPC-DS query plans as at the pinned commit" % len(close))
+        return True
+
+    def run_tests_here(self, names, timeout):
+        """Runs unittest names (module.Class.method) as one suite (so a class is set up once) in a
+        child on the patched sources: (failing or skipped ids, ids that ran), or None."""
+        import pickle
+        import tempfile
+
+        handle, out_path = tempfile.mkstemp(prefix="blast-evidence-")
+        os.close(handle)
+        sources = self.sources
+        names = sorted(names)
+
+        def run():
+            import site
+            import unittest as ut
+
+            site.main()  # the selector runs with -S; the tests need the installed packages
+            os.chdir(sources)
+            import concurrent.futures
+            import concurrent.futures.process
+
+            concurrent.futures.ProcessPoolExecutor = _InlineExecutor
+            concurrent.futures.process.ProcessPoolExecutor = _InlineExecutor
+            bad, ran = set(), set()
+
+            class Result(ut.TestResult):
+                def startTest(self, test):
+                    ran.add(test.id())
+                    super().startTest(test)
+
+                def addFailure(self, test, err):
+                    bad.add(test.id())
+
+                def addError(self, test, err):
+                    bad.add(getattr(test, "id", lambda: "?")())
+
+                def addSubTest(self, test, subtest, err):
+                    if err is not None:
+                        bad.add(test.id())
+
+                def addSkip(self, test, reason):
+                    bad.add(test.id())
+
+                def addExpectedFailure(self, test, err):
+                    bad.add(test.id())
+
+                def addUnexpectedSuccess(self, test):
+                    bad.add(test.id())
+
+            ut.TestSuite(ut.TestLoader().loadTestsFromNames(names)).run(Result())
+            with open(out_path, "wb") as f:
+                pickle.dump((sorted(bad), sorted(ran)), f)
+            return True
+
+        try:
+            if not self.in_patched_child(run, timeout=timeout, swap=True):
+                return None
+            with open(out_path, "rb") as f:
+                bad, ran = pickle.load(f)
+        except Exception as error:  # noqa: BLE001
+            log("evidence run failed:", repr(error))
+            return None
+        finally:
+            try:
+                os.unlink(out_path)
+            except OSError:
+                pass
+        return set(bad), set(ran)
+
+    def plans_unchanged(self):
+        """True if every executed TPC-DS query comes out of parsing, optimizing and planning with
+        the patched sources exactly as at the pinned commit (plan and duckdb SQL)."""
+        plans, ref = self.plans, self.per_query
+        executed = [k for k in range(len(ref["rows"])) if ref["rows"][k] is not None]
+        script = os.path.join(HERE, "tpcds_check.py")
+        sources = self.sources
+
+        def check():
+            import importlib.util
+
+            spec = importlib.util.spec_from_file_location("tpcds_check", script)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            for k, got in module.iter_front_digests(sources, executed):
+                if got != (plans["plans"][k], plans["duckdb"][k]):
+                    return False
+            return True
+
+        try:
+            return bool(self.in_patched_child(check, timeout=WHOLE_RECHECK_SECONDS))
+        except Exception as error:  # noqa: BLE001
+            log("plan check failed:", repr(error))
+            return False
 
     def saving_without(self, bits, drop):
         """Seconds the commit's schedule gets cheaper if the tests in ``drop`` are left out."""
@@ -768,6 +920,7 @@ class Selector:
         if whole:
             limit = min(limit, WHOLE_RECHECK_BUDGET)
         if estimate > limit:
+            self.pq_refused = not textual  # (a changed fixture text is never left to evidence)
             log("per-query test: %d queries (%d before planning only, %d by new text), about %.1f s to re-check "
                 "for %.1f s saved; running it whole" % (len(queries) + len(textual), len(cheap), len(textual),
                                                         estimate, saving))
@@ -961,6 +1114,8 @@ class Selector:
 
     def memo_index(self):
         """The TPC-DS step records' index (tpcds_memo), loaded once; None when the image has none."""
+        if not hasattr(self, "_memo_index") and os.environ.get("BLAST_NO_MEMO"):
+            self._memo_index = None  # (for measuring the selector without the step records)
         if not hasattr(self, "_memo_index"):
             import marshal
 

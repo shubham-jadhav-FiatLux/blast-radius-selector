@@ -16,9 +16,12 @@ COPY data/sqlglot-src.tar.xz /tmp/sqlglot-src.tar.xz
 # the map's digests and uses them to check that a patched module still compiles and imports, and
 # to replay single TPC-DS queries. The digests of each TPC-DS query's plan are computed here, in
 # the image that will use them (a missing file only disables comparing plans), and so are the
-# executor's step records that let a re-check run only the steps an edit reaches.
+# executor's step records that let a re-check run only the steps an edit reaches. The TPC-H
+# tables TestExecutor loads are fetched from sqlglot at the pinned commit (checked by SHA-256),
+# so that class's tests can run here; without them those tests are kept as before.
 RUN python -c "import tarfile; tarfile.open('/tmp/sqlglot-src.tar.xz').extractall('/app/sqlglot-src', filter='data')" \
     && rm /tmp/sqlglot-src.tar.xz \
+    && python -S -B /app/fetch_fixtures.py /app/sqlglot-src \
     && python -m compileall -q /app/sqlglot-src/sqlglot \
     && python -S -B /app/import_baseline.py /app/sqlglot-src /app/import_baseline.txt \
     && python -S -B /app/tpcds_check.py --plans /app/sqlglot-src /app/tpcds_plans.json \
