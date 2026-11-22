@@ -1,5 +1,6 @@
 """Profile bounded sets of exact integer operands in isolated light unittest runs."""
 import ast
+import enum
 import builtins
 import importlib
 import importlib.abc
@@ -53,7 +54,11 @@ def compare(site, op, left, right):
         raise
     if observed.get(site, True) is not None:
         primitives = (str, int, bool, type(None))
-        if type(left) not in primitives or type(right) not in primitives:
+        singleton = lambda v: v is None or isinstance(v, enum.Enum)
+        # an enum member or None is a singleton: equality and identity agree on it
+        objects = (singleton(left) and (singleton(right) or type(right) in primitives)) or (
+            singleton(right) and type(left) in primitives)
+        if not objects and (type(left) not in primitives or type(right) not in primitives):
             observed[site] = None
         else:
             order = None
@@ -63,7 +68,7 @@ def compare(site, op, left, right):
             facts = relation_mask(op, result, left == right, left is right, order)
             # Interning can change when source is recompiled. Only singleton identity or
             # unequal primitive values can support a stable equivalence involving "is".
-            if left == right and type(left) not in (bool, type(None)):
+            if left == right and type(left) not in (bool, type(None)) and not isinstance(left, enum.Enum):
                 if op.startswith("is"):
                     observed[site] = None
                     return result
