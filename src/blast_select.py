@@ -71,8 +71,11 @@ MAX_NODES_TEST = "tests/test_parser.py::TestParser::test_max_nodes"
 # A selection this small is cheaper to run here than to pay a worker for: dialect tests only
 # (they need nothing beyond sqlglot and the standard library), at most this many, recorded at
 # most this long together.
-RERUN_MAX_TESTS = 8
-RERUN_MAX_MS = 1000
+RERUN_MAX_TESTS = 150
+RERUN_MAX_MS = 3000
+RERUN_HEAVY_MS = 1500  # tests heavier than this stay scheduled (TPC-DS, max_nodes, ...)
+RERUN_SECONDS = 30.0
+RERUN_REGISTRY = ("sqlglot/dialects/dialect.py", "sqlglot/dialects/__init__.py")
 RERUN_DIRS = ("tests/dialects/",)
 RERUN_UNAVAILABLE = ("tests/dialects/test_bigquery.py",)  # needs pytz
 
@@ -325,6 +328,41 @@ TRUSTED_DECORATORS = {"staticmethod", "classmethod", "property", "t.overload", "
                       "dataclass", "dataclasses.dataclass", "functools.cache", "functools.lru_cache", "lru_cache", "cache"}
 
 
+class _InlineExecutor:
+    """Stands in for ProcessPoolExecutor: runs each task in this process when submitted, with
+    its arguments and result copied through pickle as a real pool would."""
+
+    def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **kwargs):
+        import pickle
+
+        if initializer is not None:
+            initializer(*pickle.loads(pickle.dumps(initargs)))
+
+    def submit(self, fn, /, *args, **kwargs):
+        import concurrent.futures
+        import pickle
+
+        future = concurrent.futures.Future()
+        try:
+            fn, args, kwargs = pickle.loads(pickle.dumps((fn, args, kwargs)))
+            future.set_result(pickle.loads(pickle.dumps(fn(*args, **kwargs))))
+        except BaseException as error:  # noqa: BLE001 - the future carries it, like a real pool
+            future.set_exception(error)
+        return future
+
+    def map(self, fn, *iterables, timeout=None, chunksize=1):
+        return [fn(*args) for args in zip(*iterables)]
+
+    def shutdown(self, wait=True, *, cancel_futures=False):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
 def _defs(tree):
     """Every def and class of a module by qualified name ("C.f", "f.<locals>.g")."""
     out = {}
@@ -529,9 +567,12 @@ class Selector:
             if self.core is None or any(_module_of(p) in self.core for p in self.import_check):
                 for index in self.fresh:  # these import sqlglot in a fresh interpreter
                     acc[0] |= 1 << index
-        if not acc[1] and acc[0] and self.rerun_passes(acc[0]):
-            acc[0] = 0
-            return acc
+        if not acc[1] and acc[0]:
+            kept = self.rerun_select(acc[0])
+            if kept is not None:
+                acc[0] = kept
+                if not kept:
+                    return acc
         # test_max_nodes first: while it is in, leaving out the per-query test saves little
         if not acc[1] and acc[0] & self.mx_bit and self.max_nodes_recheck():
             acc[0] &= ~self.mx_bit
@@ -715,6 +756,105 @@ class Selector:
             log("per-query test passes for queries", sorted(queries),
                 "(%d by checkpoints, %d by plan) - left out" % (len(by_points), len(cheap) - len(by_points)))
         return ok
+
+    def rerun_select(self, bits):
+        """The selection after running its light tests here, with unittest over the patched
+        sources in a forked child: tests that pass are left out; any that fails, errors, is
+        skipped, has a failing subtest or does not run stays, and so does every test heavier
+        than RERUN_HEAVY_MS (other checks handle those). Only for edits confined to sqlglot's
+        Python files outside the dialect registry, and when the light tests are cheap to run.
+        None when not tried."""
+        if not self.changed or not self.touched or any(
+                not (p.startswith("sqlglot/") and p.endswith(".py")) or p in RERUN_REGISTRY for p in self.touched):
+            return None
+        light, heavy, total = {}, 0, 0
+        rest = bits
+        while rest:
+            low = rest & -rest
+            i = low.bit_length() - 1
+            rest ^= low
+            if i >= len(self.test_ids) or i >= len(self.index_to_number) or self.index_to_number[i] < 0:
+                return None
+            ms = self.ms.get(self.index_to_number[i], 1 << 30)
+            parts = self.test_ids[i].split("::")
+            if ms > RERUN_HEAVY_MS or len(parts) != 3 or not parts[0].endswith(".py"):
+                heavy |= low
+                continue
+            light["%s.%s.%s" % (parts[0][:-3].replace("/", "."), parts[1], parts[2])] = low
+            total += ms
+        if not light or len(light) > RERUN_MAX_TESTS or total > RERUN_MAX_MS:
+            return None
+        names = sorted(light)
+        import pickle
+        import tempfile
+
+        handle, out_path = tempfile.mkstemp(prefix="blast-rerun-")
+        os.close(handle)
+        sources = self.sources
+
+        def run():
+            import site
+            import unittest as ut
+
+            site.main()  # the selector runs with -S; the tests need the installed packages
+            os.chdir(sources)
+            # a process pool's workers would import the pinned sqlglot, not the patched one
+            import concurrent.futures
+            import concurrent.futures.process
+
+            concurrent.futures.ProcessPoolExecutor = _InlineExecutor
+            concurrent.futures.process.ProcessPoolExecutor = _InlineExecutor
+            bad, ran = set(), set()
+
+            class Result(ut.TestResult):
+                def startTest(self, test):
+                    ran.add(test.id())
+                    super().startTest(test)
+
+                def addFailure(self, test, err):
+                    bad.add(test.id())
+
+                def addError(self, test, err):
+                    bad.add(getattr(test, "id", lambda: "?")())
+
+                def addSubTest(self, test, subtest, err):
+                    if err is not None:
+                        bad.add(test.id())
+
+                def addSkip(self, test, reason):
+                    bad.add(test.id())
+
+                def addExpectedFailure(self, test, err):
+                    bad.add(test.id())
+
+                def addUnexpectedSuccess(self, test):
+                    bad.add(test.id())
+
+            suite = ut.TestLoader().loadTestsFromNames(names)
+            suite.run(Result())
+            with open(out_path, "wb") as f:
+                pickle.dump((sorted(bad), sorted(ran)), f)
+            return True
+
+        try:
+            ok = self.in_patched_child(run, timeout=min(RERUN_SECONDS, 5.0 + 4 * total / 1000))
+            if not ok:
+                return None
+            with open(out_path, "rb") as f:
+                bad, ran = pickle.load(f)
+        except Exception as error:  # noqa: BLE001
+            log("re-run failed:", repr(error))
+            return None
+        finally:
+            os.unlink(out_path)
+        if any(b not in light for b in bad):
+            return None  # a class or module could not be set up: keep everything
+        kept = heavy
+        for name, low in light.items():
+            if name in bad or name not in ran:
+                kept |= low
+        log("%d light tests re-run here, %d kept" % (len(light), sum(1 for n in light if n in bad or n not in ran)))
+        return kept
 
     def rerun_passes(self, bits):
         """True if a small selection of dialect tests, run with unittest over the patched

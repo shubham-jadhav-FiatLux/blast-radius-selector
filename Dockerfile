@@ -4,6 +4,9 @@ FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf107
 WORKDIR /app
 # Fixed so the TPC-DS plan digests computed below match the ones computed while scoring.
 ENV PYTHONHASHSEED=0
+# The packages sqlglot's tests import, at the versions the tests are labelled with, so the
+# selector can run cheap candidate tests itself.
+RUN pip install --no-cache-dir duckdb==2.0.0 numpy==2.5.5 pandas==3.1.1 python-dateutil==4.0.0 pytz==2026.6 tzdata==2026.6
 COPY src/ /app/
 COPY data/map.bin /app/map.bin
 COPY data/sqlglot-src.tar.xz /tmp/sqlglot-src.tar.xz
