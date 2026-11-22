@@ -570,6 +570,23 @@ def fingerprints(root, queries, replay=None):
     out = {}
     for k in wanted:
         meta, sql, _ = sqls[k]
+        rebuilt = replay.front_plan(k) if replay is not None and meta.get("execute") else None
+        if rebuilt is not None:
+            # nothing the edit reaches ran before this query's plan existed: its recorded optimized
+            # form is what parse_one and optimize give, and its duckdb SQL the recorded one
+            from sqlglot.executor.python import PythonExecutor
+            from sqlglot.executor.table import ensure_tables
+            from sqlglot.planner import Plan
+
+            q = replay.queries[k]
+            found = {name: tables[name] for name in q["found"]}
+            replay.active, replay.expected = k, found
+            try:
+                table = pickle.loads(pickle.dumps(PythonExecutor(tables=ensure_tables(found)).execute(Plan(rebuilt))))
+            finally:
+                replay.active = None
+            out[k] = (_digest((list(table.columns), [tuple(row) for row in table.rows])), q["duckd"])
+            continue
         expression = pickle.loads(pickle.dumps(parse_one(sql)))
         if not meta.get("execute"):
             out[k] = (None, None)

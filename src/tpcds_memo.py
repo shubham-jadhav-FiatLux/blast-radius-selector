@@ -120,6 +120,67 @@ def _inputs(executor, node, contexts):
     )
 
 
+class _Unsupported(Exception):
+    pass
+
+
+def ser(v):
+    """An optimized expression as nested tuples (marshal can store them) that keep every arg key,
+    those set to None or [] too: a pickle round trip drops those keys, and the planner tells an
+    absent arg from an empty one (``if joins is not None``)."""
+    import enum
+
+    from sqlglot.expressions.core import Expr
+
+    if isinstance(v, Expr):
+        return ("E", type(v).__module__, type(v).__qualname__, tuple((k, ser(a)) for k, a in v.args.items()),
+                ser(getattr(v, "_type", None)), ser(getattr(v, "comments", None)), ser(getattr(v, "_meta", None)))
+    if v is None or isinstance(v, (bool, int, float, str)):
+        return ("V", v)
+    if isinstance(v, enum.Enum):
+        return ("N", type(v).__module__, type(v).__qualname__, v.name)
+    if isinstance(v, list):
+        return ("L", tuple(ser(x) for x in v))
+    if isinstance(v, tuple):
+        return ("T", tuple(ser(x) for x in v))
+    if isinstance(v, dict) and all(isinstance(k, str) for k in v):
+        return ("D", tuple((k, ser(x)) for k, x in v.items()))
+    raise _Unsupported(type(v).__name__)
+
+
+def _cls(module, qualname):
+    import importlib
+
+    obj = importlib.import_module(module)
+    for part in qualname.split("."):
+        obj = getattr(obj, part)
+    return obj
+
+
+def deser(t):
+    tag = t[0]
+    if tag == "V":
+        return t[1]
+    if tag == "N":
+        return getattr(_cls(t[1], t[2]), t[3])
+    if tag == "L":
+        return [deser(x) for x in t[1]]
+    if tag == "T":
+        return tuple(deser(x) for x in t[1])
+    if tag == "D":
+        return {k: deser(x) for k, x in t[1]}
+    cls = _cls(t[1], t[2])
+    obj = cls(**{k: deser(a) for k, a in t[3]})
+    obj._type = deser(t[4])
+    comments = deser(t[5])
+    if comments is not None or getattr(obj, "comments", None) is not None:
+        obj.comments = comments
+    meta = deser(t[6])
+    if meta is not None:
+        obj._meta = meta
+    return obj
+
+
 class _Lines:
     """The sqlglot code objects that run, segment by segment (each line fires once a segment)."""
 
@@ -164,7 +225,8 @@ class _Lines:
 def record(root, target):
     if root not in sys.path:
         sys.path.insert(0, root)
-    from sqlglot import find_tables, parse_one
+    import sqlglot.executor as executor_module
+    from sqlglot import find_tables, parse_one, transpile
     from sqlglot.executor import execute
     from sqlglot.executor.python import PythonExecutor
     from tests.helpers import FIXTURES_DIR, TPCDS_SCHEMA, load_sql_fixture_pairs
@@ -179,9 +241,23 @@ def record(root, target):
     state = {"rec": None, "busy": False}
 
     def init(self, *args, **kwargs):
-        lines.take()
+        if state["rec"] is not None and not state["busy"]:
+            state["rec"]["fcodes"].update(lines.take())  # all that ran since the query began
+        else:
+            lines.take()
         original_init(self, *args, **kwargs)
         frame.update(lines.take())
+
+    original_plan = executor_module.Plan
+
+    def plan_hook(expression):
+        rec = state["rec"]
+        if rec is not None and rec.get("opt") is None:
+            try:
+                rec["opt"] = marshal.dumps(ser(expression))
+            except Exception:  # noqa: BLE001
+                rec["opt"] = b""
+        return original_plan(expression)
 
     def loop(self, plan):
         rec = state["rec"]
@@ -231,28 +307,44 @@ def record(root, target):
 
     original_subquery = PythonExecutor._subquery_table
     PythonExecutor.__init__, PythonExecutor._execute, PythonExecutor._subquery_table = init, loop, subquery
+    executor_module.Plan = plan_hook
     queries = {}
     os.makedirs(target, exist_ok=True)
     try:
         for k, (meta, sql, _) in enumerate(sqls):
             if not meta.get("execute"):
                 continue
-            rec = state["rec"] = {"ok": True, "steps": {}, "blobs": {}, "frame": set(), "root": None, "back": 0.0}
+            rec = state["rec"] = {"ok": True, "steps": {}, "blobs": {}, "frame": set(), "root": None, "back": 0.0,
+                                  "fcodes": set(), "opt": None}
             t0 = time.process_time()
+            found = {}
+            duckc, duckd = (), None
             try:
+                lines.take()
                 expression = pickle.loads(pickle.dumps(parse_one(sql)))
                 found = {t.name: tables[t.name] for t in find_tables(expression)}
                 table = pickle.loads(pickle.dumps(execute(expression, schema=schema, tables=found)))
                 rows = tpcds_check._digest((list(table.columns), [tuple(row) for row in table.rows]))
+                lines.take()
+                duckd = tpcds_check._digest(transpile(sql, write="duckdb")[0])
+                duckc = tuple(sorted(lines.take()))
             except Exception as error:  # noqa: BLE001
                 print("tpcds_memo: query", k, "failed:", repr(error)[:200], file=sys.stderr)
                 rec["ok"] = False
                 rows = None
             total = time.process_time() - t0
             state["rec"] = None
+            blobs = dict(rec["blobs"])
+            if rec.get("opt"):
+                blobs["__opt__"] = rec["opt"]
             with open(os.path.join(target, "q%d.marshal" % k), "wb") as f:
-                marshal.dump(rec["blobs"], f)
+                marshal.dump(blobs, f)
             queries[k] = {
+                "fcodes": tuple(sorted(rec["fcodes"])),
+                "duckc": duckc,
+                "duckd": duckd,
+                "found": tuple(sorted(found)),
+                "opt": bool(rec.get("opt")) and duckd is not None,
                 "ok": rec["ok"] and rec["root"] is not None,
                 "rows": rows,
                 "root": rec["root"],
@@ -263,6 +355,7 @@ def record(root, target):
             }
     finally:
         PythonExecutor.__init__, PythonExecutor._execute = original_init, original_execute
+        executor_module.Plan = original_plan
         PythonExecutor._subquery_table = original_subquery
         lines.close()
     index = {"codes": lines.table, "frame": tuple(sorted(frame)), "queries": queries}
@@ -304,10 +397,28 @@ class Replay:
         self.off = bool(self.dirty & set(index["frame"])) or any(p in AROUND for p in ranges)
         self.active = None
         self.expected = None  # {name: table} the active query's executor must be given
+        self.force = False  # (build-time check: every step runs)
+        self._blobs = {}
         self.busy = False
         self.ran = 0
         self.kept = 0
         self.fallbacks = 0
+
+    def blobs(self, k):
+        got = self._blobs.get(k)
+        if got is None:
+            with open(os.path.join(self.dir, "q%d.marshal" % k), "rb") as f:
+                got = self._blobs[k] = marshal.load(f)
+        return got
+
+    def front_plan(self, k):
+        """Query k's recorded optimized expression, rebuilt, when the edit reaches nothing that ran
+        before its plan existed (parse, optimize, plan) nor in its duckdb SQL; else None."""
+        q = self.queries.get(k)
+        if (not self.usable(k) or not q.get("opt") or self.dirty.intersection(q.get("fcodes", ()))
+                or self.dirty.intersection(q.get("duckc", ()))):
+            return None
+        return deser(marshal.loads(self.blobs(k)["__opt__"]))
 
     def usable(self, k):
         q = self.queries.get(k)
@@ -350,7 +461,6 @@ class Replay:
     def loop(self, executor, plan):
         k = self.active
         steps = self.queries[k]["steps"]
-        blobs = {}
         status, contexts = {}, {}
         order = _order(plan)
         keys = _keys(order)
@@ -358,17 +468,14 @@ class Replay:
         def context_of(node):
             got = contexts.get(node)
             if got is None:
-                if not blobs:
-                    with open(os.path.join(self.dir, "q%d.marshal" % k), "rb") as f:
-                        blobs.update(marshal.load(f))
-                got = contexts[node] = executor.context(pickle.loads(zlib.decompress(blobs[keys[node]])))
+                got = contexts[node] = executor.context(pickle.loads(zlib.decompress(self.blobs(k)[keys[node]])))
             return got
 
         if keys[plan.root] not in steps:
             raise PlanChanged(k)
         for node in order:
             meta = steps.get(keys[node])
-            if (meta is not None and len(set(meta[2])) == 1 and not self.dirty.intersection(meta[0])
+            if (not self.force and meta is not None and len(set(meta[2])) == 1 and not self.dirty.intersection(meta[0])
                     and all(status[d] != "changed" for d in node.dependencies)):
                 status[node] = "kept"
                 self.kept += 1
@@ -399,7 +506,8 @@ def estimate(index, ranges, k):
     dirty = dirty_codes(index["codes"], ranges)
     if dirty & set(index["frame"]) or dirty & set(q["frame"]):
         return None
-    spent = q["front"] + sum(m[1] for m in q["steps"].values() if dirty.intersection(m[0]))
+    front_clean = q.get("opt") and not dirty.intersection(q.get("fcodes", ())) and not dirty.intersection(q.get("duckc", ()))
+    spent = (0.1 * q["front"] if front_clean else q["front"]) + sum(m[1] for m in q["steps"].values() if dirty.intersection(m[0]))
     spent += 0.002 * len(q["steps"])
     return min(1.0, spent / max(q["front"] + q["back"], 1e-6))
 
@@ -416,6 +524,20 @@ def self_check(root, target):
     bad = [k for k in ks if got[k][0] != index["queries"][k]["rows"]]
     for k in bad:
         index["queries"][k]["ok"] = False
+    # every step run, from the rebuilt optimized expressions: they must give the pinned answers
+    replay.force = True
+    good = [k for k in ks if k not in bad and index["queries"][k].get("opt")]
+    try:
+        forced = tpcds_check.fingerprints(root, good, replay=replay)
+    except Exception as error:  # noqa: BLE001
+        print("tpcds_memo: forced replay failed:", repr(error)[:200], file=sys.stderr)
+        forced = {}
+    for k in good:
+        if forced.get(k, (None, None)) != (index["queries"][k]["rows"], index["queries"][k]["duckd"]):
+            index["queries"][k]["opt"] = False
+    replay.force = False
+    print("tpcds_memo: %d of %d queries rebuilt from their optimized form" % (
+        sum(1 for k in good if index["queries"][k]["opt"]), len(good)), file=sys.stderr)
     with open(os.path.join(target, INDEX), "wb") as f:
         marshal.dump(index, f)
     print("tpcds_memo: %d queries replayable, %d replayed wrong; %d steps kept, %d run, %d fallbacks" % (
