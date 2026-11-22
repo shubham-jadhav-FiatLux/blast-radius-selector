@@ -20,15 +20,18 @@ Standard library only. Logs go to stderr; stdout carries nothing but answers.
 
 from __future__ import annotations
 
+import ast
 import heapq
 import json
 import marshal
 import os
 import re
 import sys
+import types
 import unittest  # noqa: F401  sqlglot turns on its strict argument checks when tests run; so do we
 import zlib
 
+import state_diff
 import tpcds_check
 
 DATA = os.environ.get("BLAST_DATA", "/data")
@@ -45,6 +48,8 @@ PER_QUERY_BUDGET = 16.0  # most seconds of re-checking ever worth trying instead
 CHILD_SECONDS = 20.0  # longest any single patched child may run before it is killed
 IMPORT_SECONDS = 8.0  # an import check normally takes well under a second
 TOTAL_CHILD_SECONDS = 100.0  # all patched children together, for the whole batch
+STATE_DIFF_MODULES = 250  # fingerprint at most this many modules to measure an import-time edit
+STATE_DIFF_SECONDS = 20.0
 
 CONFIG_FILES = {"pyproject.toml", "setup.cfg", "tox.ini", "pytest.ini", "conftest.py", ".coveragerc"}
 CODING_RE = re.compile(r"^[ \t\f]*#.*?coding[:=]")
@@ -284,6 +289,60 @@ def changed_columns(old, new):
     return p, len(old) - s, old[p : len(old) - s], new[p : len(new) - s]
 
 
+def _own_state(stmt, bound):
+    """A top-level statement whose only effect is on its module's own namespace."""
+    if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        # decorators run arbitrary code on the definition (registries); only plain names that
+        # sqlglot uses to annotate are trusted
+        return all(isinstance(d, (ast.Name, ast.Attribute)) and ast.unparse(d) in TRUSTED_DECORATORS for d in stmt.decorator_list)
+    if isinstance(stmt, (ast.Import, ast.ImportFrom, ast.Pass)):
+        return True
+    if isinstance(stmt, ast.Expr):
+        return isinstance(stmt.value, ast.Constant)  # a docstring
+    if isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+        targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+        for t in targets:
+            for sub in ast.walk(t):
+                if isinstance(sub, (ast.Attribute, ast.Subscript)):
+                    base = sub.value
+                    while isinstance(base, (ast.Attribute, ast.Subscript)):
+                        base = base.value
+                    if not (isinstance(base, ast.Name) and base.id in bound):
+                        return False  # stores into another module's object
+        return True
+    if isinstance(stmt, (ast.If, ast.Try)):
+        parts = stmt.body + stmt.orelse + getattr(stmt, "finalbody", [])
+        for handler in getattr(stmt, "handlers", []):
+            parts += handler.body
+        return all(_own_state(x, bound) for x in parts)
+    return False
+
+
+TRUSTED_DECORATORS = {"staticmethod", "classmethod", "property", "t.overload", "typing.overload", "overload",
+                      "dataclass", "dataclasses.dataclass", "functools.cache", "functools.lru_cache", "lru_cache", "cache"}
+
+
+def _defs(tree):
+    """Every def and class of a module by qualified name ("C.f", "f.<locals>.g")."""
+    out = {}
+
+    def walk(node, prefix):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                name = prefix + child.name
+                if name in out:
+                    out[name + "#%d" % len(out)] = child  # a redefinition: keep both, in order
+                else:
+                    out[name] = child
+                inner = name + (".<locals>." if not isinstance(child, ast.ClassDef) else ".")
+                walk(child, inner)
+            elif isinstance(child, ast.stmt) or isinstance(child, ast.excepthandler) or isinstance(child, ast.match_case):
+                walk(child, prefix)
+
+    walk(tree, "")
+    return out
+
+
 class _Span:
     """A stand-in block covering old lines start .. start+count-1."""
 
@@ -392,6 +451,11 @@ class Selector:
         self.files = blob["files"]
         self.reads = blob["reads"]
         self.class_data = blob.get("class_data", {})
+        self.attr_readers = blob.get("attr_readers", {})
+        self.key_readers = blob.get("key_readers", {})
+        self.global_readers = blob.get("global_readers")
+        self.global_external = blob.get("global_external", {})
+        self._pristine = {}
         self.source_readers = blob.get("source_readers", {})
         self.test_ids = list(blob.get("tests", ()))
         self.mx_bit = 0
@@ -431,6 +495,7 @@ class Selector:
         # [tests, everything, queries of the per-query test, per-query test charged as a whole,
         #  those queries the edit reaches after their plan exists, steps it reaches before that]
         acc = [0, False, set(), False, set(), 0]
+        self.why = None
         self.import_check = set()
         self.touched = set()
         self.unmodeled = set()
@@ -446,12 +511,17 @@ class Selector:
             if not self.imports_cleanly():
                 log("patched modules no longer import:", sorted(self.import_check))
                 if self.import_hung:
-                    acc[1] = True
+                    self._mark(acc, "check")
+                self.why = self.why or ("check" if acc[1] else None)
                 for path in sorted(self.import_check):
+                    self._checking = True
                     self.unimportable(path, self.files.get(path), acc)
-            elif self.unmodeled:
+                    self._checking = False
+                if acc[1]:
+                    self.why = self.why or "check"
+            elif self.unmodeled and not self.measured_change(acc):
                 log("import-time edits nothing narrower covers, in", sorted(self.unmodeled), "- running everything")
-                acc[1] = True
+                self._mark(acc, "unmodeled")
             if self.core is None or any(_module_of(p) in self.core for p in self.import_check):
                 for index in self.fresh:  # these import sqlglot in a fresh interpreter
                     acc[0] |= 1 << index
@@ -859,13 +929,39 @@ class Selector:
                 self._baseline = []
         return self._baseline
 
+    _checking = False
+
+    def _mark(self, acc, why):
+        """Every test runs; ``why`` (kept for the log) says which rule gave up."""
+        acc[1] = True
+        if self.why is None:
+            self.why = "check" if self._checking else why
+
+    def _charge_label(self):
+        import linecache
+
+        frame = sys._getframe(2)
+        name = frame.f_code.co_name
+        text = linecache.getline(frame.f_code.co_filename, frame.f_lineno)
+        if name == "charge_line":
+            return "line"
+        if name == "python_change":
+            if "hit[0]" in text:
+                return "line"
+            if "source_readers" in text:
+                return "file"
+            return "value"
+        if name in ("unimportable", "module_level"):
+            return "check"
+        return "file"
+
     def charge(self, acc, sid, queries=None, back=None, steps=0):
         """Adds a test set. ``queries`` says which queries of the per-query test the edit can
         reach through this set; without it, that test is charged as a whole. ``back`` says
         which of those it can reach after their plan exists (all of them when not known), and
         ``steps`` in which steps up to the plan (tpcds_check.STEPS; 0 when not known)."""
         if sid == GLOBAL:
-            acc[1] = True
+            self._mark(acc, self._charge_label())
         elif sid >= 0:
             bits = self.sets[sid]
             acc[0] |= bits
@@ -881,11 +977,11 @@ class Selector:
         path = ch.path or ch.old_path
         self.touched.update(p for p in (ch.path, ch.old_path) if p)
         if path is None or ch.status == "unknown":
-            acc[1] = True
+            self._mark(acc, "file")
             return
         base = path.rsplit("/", 1)[-1]
         if base in CONFIG_FILES:
-            acc[1] = True
+            self._mark(acc, "file")
             return
         if path.endswith(".py"):
             info = self.files.get(path)
@@ -897,7 +993,7 @@ class Selector:
                 return
             if info is None:  # a new module nothing imports yet
                 if path.startswith("sqlglot/"):
-                    acc[1] = True
+                    self._mark(acc, "file")
                 return
             self.python_change(path, info, ch.blocks, acc)
             return
@@ -968,13 +1064,284 @@ class Selector:
         if path.startswith("tests/"):
             sid = self.scopes.get(path)
             if sid is None:
-                acc[1] = True
+                self._mark(acc, "file")
             else:
                 self.charge(acc, sid)
         elif path.startswith("sqlglot/") or info is None:
-            acc[1] = True
+            caller = sys._getframe(1).f_code.co_name
+            self._mark(acc, {"unmodeled_edit": "unmodeled", "unimportable": "check"}.get(caller, "file"))
         else:
             self.charge(acc, info["users"])
+
+    def scoped_edit(self, path, info, b, i, ln, acc):
+        """An edit the line rules cannot place, narrowed by the compile unit around it (a
+        module-level statement, or one statement of a class body). A blank or comment-only line
+        removed (or left without code) changes nothing. When the unit is a def whose header
+        (decorators, parameters, return annotation) stays the same, only runs of that function
+        can see the edit: the tests that ran any line of it are charged, with an import check
+        where it also ran at import. Any other edit to a class-body statement charges the users
+        of the class and its family (from the map), with an import check. The rest is left to
+        the caller."""
+        flags = info["flags"]
+        if not flags[ln - 1] & (IN_STRING | CONTINUED):
+            old_text = b.old[i] if i < len(b.old) else None
+            new_text = b.new[i] if len(b.old) == len(b.new) and i < len(b.new) else None
+            if old_text is not None and not code_lines([old_text]) and (new_text is None or not code_lines([new_text])):
+                return True
+        lines = self.source_lines(path, info)
+        units = self.units_for(info, [b])
+        if lines is None or not units:
+            return False
+        (u0, u1), inner = next(iter(units.items()))
+        try:
+            old = ast.parse("\n".join(_dedent(lines[u0 - 1 : u1]) or [])).body
+            new = ast.parse("\n".join(_dedent(_apply(lines, inner, u0, u1)) or [])).body
+        except (SyntaxError, ValueError, TypeError):
+            return False
+        defs = (ast.FunctionDef, ast.AsyncFunctionDef)
+        if len(old) == 1 and len(new) == 1 and isinstance(old[0], defs) and type(old[0]) is type(new[0]):
+            dump = lambda n: ast.dump(n, include_attributes=False) if n is not None else ""
+            head = lambda f: (f.name, dump(f.args), [dump(d) for d in f.decorator_list], dump(f.returns),
+                              [dump(t) for t in getattr(f, "type_params", [])])
+            if head(old[0]) == head(new[0]):
+                log(path, "edit inside the body of %s; charging the tests that ran it" % old[0].name)
+                for l2 in range(u0, u1 + 1):
+                    self.charge(acc, info["sets"].get(l2, NO_TESTS))
+                    if l2 in info["checks"]:
+                        self.import_check.add(path)
+                return True
+        if not path.startswith("sqlglot/"):
+            return False
+        for a, z, sid in info.get("class_fb", ()):  # innermost class span first
+            if a <= u0 and u1 <= z:
+                if sid == GLOBAL:
+                    return False
+                log(path, "edit in a class body at line %d; charging the class's users" % u0)
+                self.charge(acc, sid)
+                self.import_check.add(path)
+                return True
+        return False
+
+    def measured_change(self, acc):
+        """Import-time edits the line rules cannot place, charged by what the patched import
+        actually changed (see state_diff.py): readers of each changed class attribute or module
+        global (by key for a dict), the tests that ran a changed function. Only when every
+        top-level statement the patch touches can change nothing but its module's own state.
+        False when that cannot be done; the caller then runs everything."""
+        if self.global_readers is None or not hasattr(os, "fork"):
+            return False
+        scope = set()
+        for path in self.unmodeled:  # the other files' edits were charged line by line
+            info = self.files.get(path)
+            if info is None or not path.startswith("sqlglot/") or not self.module_level_safe(path, info):
+                return False
+            scope.add(_module_of(path))
+            scope.update(m for m in info.get("importers", ()) if not m.endswith("__main__"))
+        if len(scope) > STATE_DIFF_MODULES:
+            log("state diff: %d modules to compare, too many" % len(scope))
+            return False
+        names = sorted(scope)
+        import pickle
+        import tempfile
+
+        handle, out_path = tempfile.mkstemp(prefix="blast-state-")
+        os.close(handle)
+
+        def check():
+            import importlib
+
+            for name in names:
+                importlib.import_module(name)
+            with open(out_path, "wb") as f:
+                pickle.dump(state_diff.fingerprint(names, tpcds_check.value_digest), f)
+            return True
+
+        try:
+            if not self.in_patched_child(check, timeout=STATE_DIFF_SECONDS):
+                return False
+            with open(out_path, "rb") as f:
+                after = pickle.load(f)
+        except Exception as error:  # noqa: BLE001
+            log("state diff failed:", repr(error))
+            return False
+        finally:
+            os.unlink(out_path)
+        before = self.pristine_fingerprint(names)
+        if before is None:
+            return False
+        diff = state_diff.differences(before, after)
+        charged = 0
+        for key, how in sorted(diff.items(), key=repr):
+            if key[0] == "k":
+                continue
+            sid = self.state_charge(key, how, diff.get(("k",) + key))
+            if sid == GLOBAL:
+                log("state diff: %s %s reaches every test" % (how, key[1:]))
+                return False
+            self.charge(acc, sid)
+            charged += 1
+        log("state diff over %d modules: %d values changed" % (len(names), charged))
+        return True
+
+    def pristine_fingerprint(self, names):
+        """The pinned import's fingerprints for these modules (cached per module)."""
+        import importlib
+
+        out = {}
+        for name in names:
+            got = self._pristine.get(name)
+            if got is None:
+                try:
+                    importlib.import_module(name)
+                    got = state_diff.fingerprint([name], tpcds_check.value_digest)
+                except Exception as error:  # noqa: BLE001
+                    log("pristine fingerprint of", name, "failed:", repr(error))
+                    return None
+                self._pristine[name] = got
+            out.update(got)
+        return out
+
+    def state_charge(self, key, how, keys):
+        """The test set for one changed module global or class attribute."""
+        kind, where, attr = key
+        value = None
+        holder = sys.modules.get(where) if kind == "g" else self.pristine_class(where)
+        if holder is not None:
+            value = vars(holder).get(attr)
+        func = value.__func__ if isinstance(value, (staticmethod, classmethod)) else value
+        if isinstance(func, property):
+            func = func.fget
+        if isinstance(func, types.FunctionType) and how != "added":
+            lines = self.def_lines(func)
+            if lines is not None:
+                path, a, z = lines
+                bits = 0
+                for ln in range(a, z + 1):
+                    sid = self.files[path]["sets"].get(ln, NO_TESTS)
+                    if sid == GLOBAL:
+                        return GLOBAL
+                    if sid >= 0:
+                        bits |= self.sets[sid]
+                return self.bits_sid(bits)
+        if how == "added":
+            if kind == "g":
+                return NO_TESTS  # a new module global: only new code can name it
+            cls = holder
+            for base in (cls.__mro__[1:] if cls is not None else ()):
+                if attr in vars(base):
+                    return self.tag_readers("%s.%s:%s" % (base.__module__, base.__qualname__, attr), None)
+            return NO_TESTS  # a new class attribute nothing inherited: only new code can name it
+        if kind == "g":
+            tag = "%s:%s" % (where, attr)
+            if how == "removed" and not self.still_named(where, attr):
+                return self.global_external.get(tag, NO_TESTS)  # its module no longer uses it
+            return self.global_readers.get(tag, NO_TESTS)
+        return self.tag_readers("%s:%s" % (where, attr), keys if how == "changed" else None)
+
+    def still_named(self, module, name):
+        """True if the patched module still reads ``name`` as a bare name."""
+        for path, (info, blocks) in self.changed.items():
+            if _module_of(path) != module:
+                continue
+            try:
+                tree = ast.parse(self.patched_text(path, info, blocks))
+            except (SyntaxError, ValueError):
+                return True
+            return any(isinstance(n, ast.Name) and n.id == name for n in ast.walk(tree))
+        return True
+
+    def tag_readers(self, tag, keys):
+        """Readers of a class attribute; by key when only some keys of a dict changed."""
+        if keys is not None and tag in self.key_readers:
+            base, per_key = self.key_readers[tag]
+            if base == GLOBAL:
+                return GLOBAL
+            bits = self.sets[base] if base >= 0 else 0
+            for k in keys:
+                sid = per_key.get(k, NO_TESTS)
+                if sid == GLOBAL:
+                    return GLOBAL
+                if sid >= 0:
+                    bits |= self.sets[sid]
+            return self.bits_sid(bits)
+        return self.attr_readers.get(tag, NO_TESTS)
+
+    def bits_sid(self, bits):
+        """A set id for a bitset built here (appended to the table)."""
+        if not bits:
+            return NO_TESTS
+        self.sets.append(bits)
+        return len(self.sets) - 1
+
+    def pristine_class(self, owner):
+        """The pinned class for "module.qualname", if the module is imported here."""
+        module, _, qualname = owner.partition(".")
+        while True:
+            obj = sys.modules.get(module)
+            if obj is not None:
+                for part in qualname.split("."):
+                    obj = getattr(obj, part, None) if obj is not None else None
+                if isinstance(obj, type):
+                    return obj
+            head, _, rest = qualname.partition(".")
+            if not rest:
+                return None
+            module, qualname = module + "." + head, rest
+
+    def def_lines(self, func):
+        """(path, first line, last line) of a function's def in the pinned sources."""
+        filename = func.__code__.co_filename
+        if not filename.startswith(self.sources + os.sep):
+            return None
+        path = os.path.relpath(filename, self.sources)
+        info = self.files.get(path)
+        tree = self.old_tree(path, info) if info is not None else None
+        if tree is None:
+            return None
+        qualname = func.__qualname__
+        node = _defs(tree).get(qualname)
+        if node is None or node.lineno > func.__code__.co_firstlineno or node.end_lineno < func.__code__.co_firstlineno:
+            return None
+        return path, node.lineno, node.end_lineno
+
+    def old_tree(self, path, info):
+        cache = self.__dict__.setdefault("_trees", {})
+        if path not in cache:
+            lines = self.source_lines(path, info)
+            try:
+                cache[path] = ast.parse("\n".join(lines)) if lines is not None else None
+            except (SyntaxError, ValueError):
+                cache[path] = None
+        return cache[path]
+
+    def module_level_safe(self, path, info):
+        """True if every top-level statement the patch adds, removes or changes can change
+        nothing but the module's own namespace (defs, classes, assignments to its names,
+        imports, docstrings, and if/try blocks of those), so that fingerprints see all of it."""
+        lines = self.source_lines(path, info)
+        blocks = self.changed.get(path, (None, None))[1]
+        if lines is None or blocks is None:
+            return False
+        try:
+            old = ast.parse("\n".join(lines))
+            new = ast.parse(self.patched_text(path, info, blocks))
+        except (SyntaxError, ValueError):
+            return False
+        dump = lambda n: ast.dump(n, include_attributes=False)
+        before = [dump(x) for x in old.body]
+        after = [dump(x) for x in new.body]
+        bound = {t.id for x in old.body + new.body if isinstance(x, (ast.Assign, ast.AnnAssign))
+                 for t in (x.targets if isinstance(x, ast.Assign) else [x.target]) if isinstance(t, ast.Name)}
+        import difflib
+
+        matcher = difflib.SequenceMatcher(a=before, b=after, autojunk=False)
+        for op, a0, a1, b0, b1 in matcher.get_opcodes():
+            if op == "equal":
+                continue
+            for stmt in old.body[a0:a1] + new.body[b0:b1]:
+                if not _own_state(stmt, bound):
+                    return False
+        return True
 
     def unmodeled_edit(self, path, info, acc):
         """An edit to code that runs when the module is imported, of a kind nothing narrower
@@ -982,9 +1349,10 @@ class Selector:
         (see unimportable); if it still imports, anything could have changed, so run()
         charges everything. The import check decides which."""
         fb = info.get("module_fb") if path.startswith("sqlglot/") else None
-        if fb is None or fb == GLOBAL or not os.path.isdir(self.sources):
+        if fb is None or not os.path.isdir(self.sources):
             self.module_level(path, info, acc)
             return
+        # if it still imports, what it changed is measured (measured_change)
         self.unmodeled.add(path)
         self.import_check.add(path)
 
@@ -1332,6 +1700,8 @@ class Selector:
                     self.charge(acc, sid)
                     self.import_check.add(path)
                     continue
+                if self.scoped_edit(path, info, b, i, ln, acc):
+                    continue
                 self.unmodeled_edit(path, info, acc)
             if acc[1]:
                 return
@@ -1415,6 +1785,15 @@ def _improve(bins, loads, ms, rounds=64):
             return
 
 
+def load_map(data):
+    """The map blob: marshal data, xz- or zlib-compressed."""
+    if data[:6] == b"\xfd7zXZ\x00":
+        import lzma
+
+        return marshal.loads(lzma.decompress(data))
+    return marshal.loads(zlib.decompress(data))
+
+
 # ----------------------------------------------------------------------------- main
 def main():
     with open(os.path.join(DATA, "tests.json"), "rb") as f:
@@ -1428,7 +1807,7 @@ def main():
     unknown = []
     try:
         with open(MAP_PATH, "rb") as f:
-            blob = marshal.loads(zlib.decompress(f.read()))
+            blob = load_map(f.read())
         number_of = {t["id"]: t["number"] for t in tests}
         index_to_number = [number_of.get(t, -1) for t in blob["tests"]]
         mapped = set(index_to_number)

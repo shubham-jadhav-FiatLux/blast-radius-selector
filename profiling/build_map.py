@@ -5,7 +5,7 @@ Usage (inside the profiling image, with the sqlglot checkout mounted at /src):
     python profiling/build_map.py --src /src --out data/map.bin \
         --profile out/main.txt.gz out/max_nodes.txt.gz --outcomes out/main.json out/max_nodes.json
 
-The map is a zlib-compressed marshal blob. Test sets are stored as Python ints used as
+The map is an xz-compressed marshal blob. Test sets are stored as Python ints used as
 bitsets over test indices; ``GLOBAL`` (-2) means "every test".
 """
 
@@ -778,14 +778,14 @@ def main():
     rel_of = {module_name(rel): rel for rel in files if rel.startswith("sqlglot/")}
     module_cache = {}
 
-    def global_readers(modname, name):
+    def global_readers(modname, name, direct=False):
         """Tests that can read global ``name`` of module ``modname``: those that ran a statement
         of that module mentioning it as a bare name, those that read it from outside (attribute
         access, a run-time ``from ... import``, the module's __dict__), and, for import-time code
         elsewhere that mentions it as an attribute, whoever that code's results reach."""
         if not args.modreads:
             return name_cov(name)
-        key = (modname, name)
+        key = (modname, name, direct)
         if key in module_cache:
             return module_cache[key]
         module_cache[key] = GLOBAL  # guards against cycles while it is being computed
@@ -794,7 +794,7 @@ def main():
         if bits != GLOBAL:
             parts = [union_eff(rel, files[rel].get("runtime_bare", {}).get(name, ()))]
             parts += [mod_bits.get((modname, n), 0) for n in (name, "__dict__", "__dir__")]
-            for orel, lines in mentions.get(name, ()):
+            for orel, lines in [] if direct else mentions.get(name, ()):
                 at_import = [ln for ln in lines if (orel, ln) in global_func]
                 if at_import:
                     parts.append(union_eff(orel, at_import))
@@ -1431,8 +1431,68 @@ def main():
         for ln in lines:
             out_files[rel]["cattr"][ln] = (fb, True)
 
+    # Direct readers for the measured state diff the selector makes after a patched import:
+    # every class attribute the profile saw read ("owner:attr"), and per key for the dicts read
+    # by key (with what reads the whole dict or was never keyed), and every module global.
+    attr_out = {}
+    for tag in set(attr_reads) | attr_global:
+        attr_out[tag] = GLOBAL if tag in attr_global else table.add(attr_reads[tag])
+    key_out = {}
+    by_tag = defaultdict(dict)
+    for (tag, k), bits in key_bits.items():
+        if k != "*":
+            by_tag[tag][k] = bits
+    for tag in key_tags | set(keyrun_reads):
+        if tag in attr_global or key_bits.get((tag, "*"), 0) == GLOBAL:
+            continue
+        base = key_bits.get((tag, "*"), 0) | (attr_reads.get(tag, 0) & ~keyrun_reads.get(tag, 0))
+        keys = {}
+        for k, bits in by_tag.get(tag, {}).items():
+            keys[k] = GLOBAL if bits == GLOBAL else table.add(bits)
+        key_out[tag] = (table.add(base), keys)
+    global_out = {}
+    if args.modreads:
+        for modname, rel in rel_of.items():
+            mod = sys.modules.get(modname)
+            if mod is None:
+                continue
+            for name in list(vars(mod)):
+                if name.startswith("__") and name.endswith("__"):
+                    continue
+                # direct readers: what import-time code elsewhere derived from it, the state diff
+                # measures in that code's own module
+                bits = global_readers(modname, name, direct=True)
+                if bits:
+                    global_out["%s:%s" % (modname, name)] = GLOBAL if bits == GLOBAL else table.add(bits)
+    # and what reads a module global from outside its module, which is all that a removed global
+    # can break once its module stops using it: attribute reads, and every test of a test file
+    # that imports it (that file no longer collects)
+    external_out = {}
+    if args.modreads:
+        for modname in rel_of:
+            for (m, name), bits in list(mod_bits.items()):
+                if m != modname:
+                    continue
+                external_out["%s:%s" % (m, name)] = bits
+        for (origin, name), users in test_binds.items():
+            if origin not in rel_of:
+                continue
+            key = "%s:%s" % (origin, name)
+            bits = external_out.get(key, 0)
+            for trel, _alias in users:
+                scope_bits = tests.scope(trel)
+                bits = GLOBAL if bits == GLOBAL else bits | scope_bits
+            external_out[key] = bits
+        external_out = {k: (GLOBAL if b == GLOBAL else table.add(b)) for k, b in external_out.items() if b}
+    print("build_map: state-diff readers for %d attributes, %d keyed dicts (%d keys), %d module globals"
+          % (len(attr_out), len(key_out), sum(len(v[1]) for v in key_out.values()), len(global_out)), file=sys.stderr)
+
     blob = {
         "format": FORMAT,
+        "attr_readers": attr_out,
+        "key_readers": key_out,
+        "global_readers": global_out,
+        "global_external": external_out,
         "commit": PINNED,
         "tests": tests.ids,
         "files": out_files,
@@ -1447,7 +1507,9 @@ def main():
         "per_query": per_query_reference(args.tpcds, pq_index, bool(args.tpcds_stages)),
         "sets": table.sets,
     }
-    data = zlib.compress(marshal.dumps(blob), 9)
+    import lzma
+
+    data = lzma.compress(marshal.dumps(blob), preset=9 | lzma.PRESET_EXTREME)
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "wb") as f:
         f.write(data)

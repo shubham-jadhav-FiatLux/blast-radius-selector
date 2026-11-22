@@ -113,7 +113,7 @@ def plan_digest(value):
     return fp(value)
 
 
-def value_digest(value):
+def value_digest(value, memo=None):
     """A digest of a value computed while sqlglot was imported (a parsed template, a table of
     token types, a dict of builder functions...), comparable between two imports of the same
     modules: functions by their code, constants, defaults and closures; classes and modules by
@@ -124,7 +124,8 @@ def value_digest(value):
 
     from sqlglot.expressions.core import Expr
 
-    memo = {}
+    if memo is None:
+        memo = {}  # by id: a caller may share one across values that stay alive meanwhile
     atoms = (str, int, float, bool, bytes, complex, type(None))
 
     def node(parts):
@@ -190,8 +191,9 @@ def value_digest(value):
                 for slot in getattr(klass, "__slots__", ()) or ():
                     if isinstance(slot, str) and hasattr(v, slot):
                         fields.append((slot, fp(getattr(v, slot))))
+            # (a repr may name the object's address: a lock made by each import is a new one)
             out = node(["O", type(v).__module__, type(v).__qualname__, fields]) if fields else \
-                node(["R", type(v).__qualname__, repr(v)])
+                node(["R", type(v).__qualname__, _re.sub(r" at 0x[0-9a-fA-F]+", "", repr(v))])
         memo[key] = out
         return out
 
