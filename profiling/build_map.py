@@ -499,6 +499,7 @@ def main():
     ap.add_argument("--tpcds-stages", default=None, help="front/back lines per query from profiling/tpcds_stages.py")
     ap.add_argument("--defaults", nargs="*", default=[], help="profiles recorded with PROFILE_DEFAULTS=1")
     ap.add_argument("--modreads", nargs="*", default=[], help="profiles recorded with PROFILE_MODREADS=1")
+    ap.add_argument("--cases", nargs="*", default=[], help="profiling/build_cases.py output")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     src = os.path.abspath(args.src)
@@ -1493,8 +1494,22 @@ def main():
     print("build_map: state-diff readers for %d attributes, %d keyed dicts (%d keys), %d module globals"
           % (len(attr_out), len(key_out), sum(len(v[1]) for v in key_out.values()), len(global_out)), file=sys.stderr)
 
+    # Tests that walk a SQL fixture file, case by case (PROFILE_CASES=1): for each, the fixture
+    # cases that ran each line, so that a re-check can run only the cases an edit reaches; and
+    # every line the test ran outside a case, which rules that out.
+    case_out = {}
+    if args.cases:
+        with open(args.cases[0], "rb") as f:
+            folded = marshal.load(f)
+        for nodeid, rec in folded.items():
+            i = tests.index.get(nodeid)
+            if i is not None:
+                case_out[i] = rec
+        print("build_map: per-case maps for %d fixture tests" % len(case_out), file=sys.stderr)
+
     blob = {
         "format": FORMAT,
+        "cases": case_out,
         "attr_readers": attr_out,
         "key_readers": key_out,
         "global_readers": global_out,

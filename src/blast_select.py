@@ -71,10 +71,13 @@ MAX_NODES_TEST = "tests/test_parser.py::TestParser::test_max_nodes"
 # A selection this small is cheaper to run here than to pay a worker for: dialect tests only
 # (they need nothing beyond sqlglot and the standard library), at most this many, recorded at
 # most this long together.
-RERUN_MAX_TESTS = 150
-RERUN_MAX_MS = 3000
+RERUN_MAX_TESTS = 8
+RERUN_MAX_MS = 1000
 RERUN_HEAVY_MS = 1500  # tests heavier than this stay scheduled (TPC-DS, max_nodes, ...)
 RERUN_SECONDS = 30.0
+RERUN_SPARE = 40.0  # child seconds kept for import checks
+RERUN_RETURN = 1.5  # run only when the schedule gets this many times cheaper than the run costs
+RERUN_PANDAS = ("tests/test_optimizer.py", "tests/test_executor.py")
 RERUN_REGISTRY = ("sqlglot/dialects/dialect.py", "sqlglot/dialects/__init__.py")
 RERUN_DIRS = ("tests/dialects/",)
 RERUN_UNAVAILABLE = ("tests/dialects/test_bigquery.py",)  # needs pytz
@@ -363,6 +366,41 @@ class _InlineExecutor:
         return False
 
 
+def _code_key(c):
+    """A code object's behaviour without its line numbers (nested code by its own key)."""
+    consts = tuple(_code_key(k) if isinstance(k, types.CodeType) else (type(k).__name__, repr(k)) for k in c.co_consts)
+    return (c.co_code, consts, c.co_names, c.co_varnames, c.co_freevars, c.co_cellvars, c.co_argcount,
+            c.co_posonlyargcount, c.co_kwonlyargcount, c.co_flags, c.co_exceptiontable)
+
+
+def _skeleton(c):
+    """The module or class body code with every function's code reduced to its name."""
+    consts = []
+    for k in c.co_consts:
+        if isinstance(k, types.CodeType):
+            consts.append(("fn", k.co_qualname) if k.co_flags & 1 else _skeleton(k))
+        else:
+            consts.append((type(k).__name__, repr(k)))
+    return (c.co_code, tuple(consts), c.co_names, c.co_varnames, c.co_flags, c.co_exceptiontable)
+
+
+def _function_codes(c, out=None):
+    """{qualname: code} of the functions defined by module or class bodies (not nested in
+    other functions); None if a name repeats."""
+    if out is None:
+        out = {}
+    for k in c.co_consts:
+        if not isinstance(k, types.CodeType):
+            continue
+        if k.co_flags & 1:
+            if k.co_qualname in out:
+                return None
+            out[k.co_qualname] = k
+        elif _function_codes(k, out) is None:
+            return None
+    return out
+
+
 def _defs(tree):
     """Every def and class of a module by qualified name ("C.f", "f.<locals>.g")."""
     out = {}
@@ -492,6 +530,8 @@ class Selector:
         self.files = blob["files"]
         self.reads = blob["reads"]
         self.class_data = blob.get("class_data", {})
+        self.cases = blob.get("cases", {})
+        self._path_of = {id(info): path for path, info in self.files.items()}
         self.attr_readers = blob.get("attr_readers", {})
         self.key_readers = blob.get("key_readers", {})
         self.global_readers = blob.get("global_readers")
@@ -538,6 +578,9 @@ class Selector:
         #  those queries the edit reaches after their plan exists, steps it reaches before that]
         acc = [0, False, set(), False, set(), 0]
         self.why = None
+        self.line_charges = []  # (path, line) charged line by line
+        self.other_bits = 0  # tests charged any other way
+        self._line_path = None
         self.import_check = set()
         self.touched = set()
         self.unmodeled = set()
@@ -757,36 +800,87 @@ class Selector:
                 "(%d by checkpoints, %d by plan) - left out" % (len(by_points), len(cheap) - len(by_points)))
         return ok
 
-    def rerun_select(self, bits):
-        """The selection after running its light tests here, with unittest over the patched
-        sources in a forked child: tests that pass are left out; any that fails, errors, is
-        skipped, has a failing subtest or does not run stays, and so does every test heavier
-        than RERUN_HEAVY_MS (other checks handle those). Only for edits confined to sqlglot's
-        Python files outside the dialect registry, and when the light tests are cheap to run.
-        None when not tried."""
-        if not self.changed or not self.touched or any(
-                not (p.startswith("sqlglot/") and p.endswith(".py")) or p in RERUN_REGISTRY for p in self.touched):
-            return None
-        light, heavy, total = {}, 0, 0
+    def reducible(self, bits):
+        """{test index: {(file, case)}} for the selected fixture tests that only the charged
+        lines reach, each through known fixture cases (none through a line the test runs
+        outside its cases, none charged any other way)."""
+        out = {}
         rest = bits
         while rest:
             low = rest & -rest
             i = low.bit_length() - 1
             rest ^= low
-            if i >= len(self.test_ids) or i >= len(self.index_to_number) or self.index_to_number[i] < 0:
-                return None
+            rec = self.cases.get(i)
+            if rec is None or self.other_bits & low:
+                continue
+            cases, ok = set(), True
+            for path, ln in self.line_charges:
+                sid = self.files[path]["sets"].get(ln, NO_TESTS)
+                if sid == GLOBAL:
+                    ok = False
+                    break
+                if sid < 0 or not self.sets[sid] & low:
+                    continue
+                got = rec["lines"].get(path, {}).get(ln)
+                if got is None or ln in rec["outside"].get(path, ()):
+                    ok = False
+                    break
+                cases.update(got)
+            if ok and cases:
+                names = {fid: f for f, fid in rec["files"].items()}
+                out[i] = {(names[fid], k) for fid, k in cases}
+        return out
+
+    def rerun_select(self, bits):
+        """The selection after running some of it here, with unittest over the patched sources
+        in a forked child: a few cheap dialect tests whole, and fixture tests on only the cases
+        the edit reaches (see reducible). Those that pass are left out; any that fails, errors,
+        is skipped, has a failing subtest or does not run stays, as does everything else. Only
+        for edits confined to sqlglot's Python files outside the dialect registry, and only when
+        the schedule gets cheaper by well more than the run costs. None when not tried."""
+        if not self.changed or not self.touched or any(
+                not (p.startswith("sqlglot/") and p.endswith(".py")) or p in RERUN_REGISTRY for p in self.touched):
+            return None
+        if TOTAL_CHILD_SECONDS - self.child_seconds < RERUN_SPARE:
+            return None
+        red = self.reducible(bits)
+        whole, cases, estimate, numbers = {}, {}, 0.0, {}
+        dialect, dialect_ms = {}, 0
+        pandas = False
+        rest = bits
+        while rest:
+            low = rest & -rest
+            i = low.bit_length() - 1
+            rest ^= low
+            if i >= len(self.test_ids) or i >= len(self.index_to_number) or self.index_to_number[i] < 0 or i in self.fresh:
+                continue
             ms = self.ms.get(self.index_to_number[i], 1 << 30)
             parts = self.test_ids[i].split("::")
-            # a test that starts another interpreter would see the pinned sources there, so a
-            # pass here proves nothing: it stays
-            if ms > RERUN_HEAVY_MS or len(parts) != 3 or not parts[0].endswith(".py") or i in self.fresh:
-                heavy |= low
+            if len(parts) != 3 or not parts[0].endswith(".py"):
                 continue
-            light["%s.%s.%s" % (parts[0][:-3].replace("/", "."), parts[1], parts[2])] = low
-            total += ms
-        if not light or len(light) > RERUN_MAX_TESTS or total > RERUN_MAX_MS:
+            name = "%s.%s.%s" % (parts[0][:-3].replace("/", "."), parts[1], parts[2])
+            if i in red:
+                rec = self.cases[i]
+                cases[name] = (low, red[i])
+                estimate += ms / 1000 * len(red[i]) / max(rec["total"], 1) + 0.02
+                pandas = pandas or parts[0] in RERUN_PANDAS
+            elif ms <= RERUN_HEAVY_MS and self.test_ids[i].startswith(RERUN_DIRS):
+                dialect[name] = low
+                dialect_ms += ms
+        if dialect and len(dialect) <= RERUN_MAX_TESTS and dialect_ms <= RERUN_MAX_MS:
+            whole = dialect
+            estimate += dialect_ms / 1000
+        if not whole and not cases:
             return None
-        names = sorted(light)
+        drop = 0
+        for low in list(whole.values()) + [c[0] for c in cases.values()]:
+            drop |= low
+        estimate += 0.3 + (0.6 if pandas else 0.0)
+        saving = self.saving_without(bits, drop)
+        if saving < RERUN_RETURN * estimate:
+            return None
+        names = sorted(set(whole) | set(cases))
+        allowed = {n: c[1] for n, c in cases.items()}
         import pickle
         import tempfile
 
@@ -806,6 +900,21 @@ class Selector:
 
             concurrent.futures.ProcessPoolExecutor = _InlineExecutor
             concurrent.futures.process.ProcessPoolExecutor = _InlineExecutor
+            import tests.helpers as helpers
+
+            current = {"allow": None}
+
+            def filtered(original):
+                def loader(filename, *args, **kwargs):
+                    allow = current["allow"]
+                    for k, value in enumerate(original(filename, *args, **kwargs)):
+                        if allow is None or (filename, k) in allow:
+                            yield value
+
+                return loader
+
+            for loader_name in ("load_sql_fixture_pairs", "load_sql_fixtures"):
+                setattr(helpers, loader_name, filtered(getattr(helpers, loader_name)))
             bad, ran = set(), set()
 
             class Result(ut.TestResult):
@@ -832,14 +941,15 @@ class Selector:
                 def addUnexpectedSuccess(self, test):
                     bad.add(test.id())
 
-            suite = ut.TestLoader().loadTestsFromNames(names)
-            suite.run(Result())
+            for name in names:
+                current["allow"] = allowed.get(name)
+                ut.TestLoader().loadTestsFromName(name).run(Result())
             with open(out_path, "wb") as f:
                 pickle.dump((sorted(bad), sorted(ran)), f)
             return True
 
         try:
-            ok = self.in_patched_child(run, timeout=min(RERUN_SECONDS, 5.0 + 4 * total / 1000))
+            ok = self.in_patched_child(run, timeout=min(RERUN_SECONDS, 5.0 + 4 * estimate), swap=True)
             if not ok:
                 return None
             with open(out_path, "rb") as f:
@@ -849,13 +959,15 @@ class Selector:
             return None
         finally:
             os.unlink(out_path)
-        if any(b not in light for b in bad):
+        if any(b not in names for b in bad):
             return None  # a class or module could not be set up: keep everything
-        kept = heavy
-        for name, low in light.items():
+        kept = bits & ~drop
+        for name in names:
             if name in bad or name not in ran:
-                kept |= low
-        log("%d light tests re-run here, %d kept" % (len(light), sum(1 for n in light if n in bad or n not in ran)))
+                kept |= whole[name] if name in whole else cases[name][0]
+        log("re-run here: %d whole, %d on %d fixture cases; %d kept" % (
+            len(whole), len(cases), sum(len(c[1]) for c in cases.values()),
+            sum(1 for n in names if n in bad or n not in ran)))
         return kept
 
     def rerun_passes(self, bits):
@@ -967,11 +1079,16 @@ class Selector:
         finally:
             shutil.rmtree(overlay, ignore_errors=True)
 
-    def in_patched_child(self, check, timeout=CHILD_SECONDS, snapshot=None):
+    def in_patched_child(self, check, timeout=CHILD_SECONDS, snapshot=None, swap=False):
         """Runs ``check()`` in a forked child with the patched modules (and their importers)
-        imported again over the pinned sources. False on any error or without fork."""
+        imported again over the pinned sources. False on any error or without fork. When the
+        patch changes nothing but function bodies, the child instead puts the new code into
+        the live functions, which costs next to nothing."""
         if not hasattr(os, "fork") or not os.path.isdir(self.sources):
             return False
+        swaps = self.code_swaps() if swap else None
+        if swaps is not None:
+            return self.swapped_check(swaps, check, timeout, snapshot)
         for path, (info, blocks) in self.changed.items():
             if self.source_lines(path, info) is None:
                 return False
@@ -996,6 +1113,87 @@ class Selector:
             return False
         finally:
             shutil.rmtree(overlay, ignore_errors=True)
+
+    def code_swaps(self):
+        """[(live function, new code)] when every changed file differs from the pinned one only
+        inside the bodies of module- or class-level functions; None otherwise."""
+        cache = self.__dict__.setdefault("_swaps", {})
+        key = tuple(sorted(self.changed))
+        if key in cache:
+            return cache[key]
+        if self.import_check or self.import_values:
+            return None  # what the edited code computed at import would stay as it was
+        cache[key] = None
+        if not self.changed or not self._warm:
+            return None
+        import importlib
+
+        swaps = []
+        for path, (info, blocks) in self.changed.items():
+            lines = self.source_lines(path, info)
+            if lines is None or not path.startswith("sqlglot/"):
+                return None
+            filename = os.path.join(self.sources, path)
+            try:
+                old = compile("\n".join(lines), filename, "exec", dont_inherit=True)
+                new = compile(self.patched_text(path, info, blocks), filename, "exec", dont_inherit=True)
+            except (SyntaxError, ValueError):
+                return None
+            if _skeleton(old) != _skeleton(new):
+                return None  # something outside function bodies differs
+            olds, news = _function_codes(old), _function_codes(new)
+            if olds is None or news is None or set(olds) != set(news):
+                return None
+            changed = [q for q in news if _code_key(olds[q]) != _code_key(news[q])]
+            try:
+                module = importlib.import_module(_module_of(path))
+            except Exception:  # noqa: BLE001
+                return None
+            for q in changed:
+                if "<" in q:
+                    return None  # a lambda or comprehension at module or class level
+                obj = module
+                for part in q.split("."):
+                    obj = vars(obj).get(part) if isinstance(obj, (type, types.ModuleType)) else None
+                if isinstance(obj, (staticmethod, classmethod)):
+                    obj = obj.__func__
+                if not isinstance(obj, types.FunctionType) or obj.__code__.co_qualname != q \
+                        or obj.__code__.co_freevars != news[q].co_freevars:
+                    return None
+                swaps.append((obj, news[q]))
+        cache[key] = swaps
+        return swaps
+
+    def swapped_check(self, swaps, check, timeout, snapshot):
+        """``check()`` in a forked child whose live functions run the patched code."""
+        limit = min(timeout, TOTAL_CHILD_SECONDS - self.child_seconds)
+        if limit <= 0.5:
+            return False
+        sys.stdout.flush()
+        sys.stderr.flush()
+        pid = os.fork()
+        if pid == 0:
+            status = 1
+            try:
+                import resource
+
+                cpu = int(limit) + 1
+                resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu + 1))
+                os.dup2(os.open(os.devnull, os.O_WRONLY), 1)
+                sys.stdout = sys.stderr
+                before = snapshot() if snapshot is not None else None
+                for func, code in swaps:
+                    func.__code__ = code
+                status = 0 if (check(before) if snapshot is not None else check()) else 1
+            except BaseException as error:  # noqa: BLE001
+                log("swapped child:", repr(error)[:300])
+                status = 1
+            finally:
+                os._exit(status)
+        try:
+            return self.reap(pid, limit)
+        except TimeoutError:
+            return False
 
     def forked_check(self, overlay, wanted, check=None, timeout=CHILD_SECONDS, snapshot=None):
         """Imports sqlglot once in this process, then re-imports the patched modules (and the
@@ -1127,6 +1325,11 @@ class Selector:
         return "file"
 
     def charge(self, acc, sid, queries=None, back=None, steps=0):
+        if sid >= 0 and not getattr(self, "_in_line", False):
+            self.other_bits |= self.sets[sid]
+        self._charge(acc, sid, queries, back, steps)
+
+    def _charge(self, acc, sid, queries=None, back=None, steps=0):
         """Adds a test set. ``queries`` says which queries of the per-query test the edit can
         reach through this set; without it, that test is charged as a whole. ``back`` says
         which of those it can reach after their plan exists (all of them when not known), and
@@ -1733,6 +1936,16 @@ class Selector:
         that also ran while sqlglot was imported has them only on condition that what the
         import computed with it comes out the same; that is checked with the queries."""
         sets, qsets = info["sets"], info.get("qsets", {})
+        path = self._path_of.get(id(info)) if hasattr(self, "_path_of") else None
+        if path is not None:
+            self.line_charges.append((path, ln))
+        self._in_line = True
+        try:
+            self._charge_line(acc, info, ln, sets, qsets)
+        finally:
+            self._in_line = False
+
+    def _charge_line(self, acc, info, ln, sets, qsets):
         queries = qsets.get(ln)
         if queries is None and self.plans is not None and ln in info.get("qrt", {}):
             queries, after, values = info["qrt"][ln]

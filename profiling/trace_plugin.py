@@ -1020,11 +1020,90 @@ class _PerQuery:
         return False
 
 
+# With PROFILE_CASES=1, tests that walk a SQL fixture file (tests.helpers' loaders) run each
+# case in a context of its own ("<nodeid>|call#c<file>:<k>"), so that a re-check can run just
+# the cases an edit reaches. A subTest titled like a case (check_file asserts after its loop)
+# switches to that case too.
+CASES = os.environ.get("PROFILE_CASES") == "1"
+
+
+class _PerCase:
+    def __init__(self, item):
+        self.item = item
+        self.base = item.nodeid + "|call"
+        self.patches = []
+        self.titles = {}
+
+    def __enter__(self):
+        import unittest
+
+        import tests.helpers as helpers
+
+        owner = self
+
+        def wrap(original):
+            def loader(filename, *args, **kwargs):
+                for k, value in enumerate(original(filename, *args, **kwargs)):
+                    ctx = "%s#c%s:%d" % (owner.base, filename, k)
+                    if isinstance(value, tuple) and len(value) == 3:
+                        meta, sql = value[0], value[1]
+                        owner.titles["%d, %s" % (k + 1, sql)] = ctx
+                        if isinstance(meta, dict) and meta.get("title"):
+                            owner.titles[meta["title"]] = ctx
+                    _enter(ctx)
+                    yield value
+                    _enter(owner.base)
+                _enter(owner.base)
+
+            return loader
+
+        original_subtest = unittest.TestCase.subTest
+
+        def sub_test(case, msg=None, **params):
+            ctx = owner.titles.get(str(msg or ""))
+            if ctx is not None:
+                return owner.scoped(ctx, original_subtest(case, msg, **params))
+            return original_subtest(case, msg, **params)
+
+        for name in ("load_sql_fixture_pairs", "load_sql_fixtures"):
+            original = getattr(helpers, name)
+            for target in {helpers, self.item.module}:
+                if getattr(target, name, None) is original:
+                    self.patches.append((target, name, original))
+                    setattr(target, name, wrap(original))
+        self.patches.append((unittest.TestCase, "subTest", original_subtest))
+        unittest.TestCase.subTest = sub_test
+        return self
+
+    def scoped(self, ctx, inner):
+        import contextlib
+
+        @contextlib.contextmanager
+        def manager():
+            _enter(ctx)
+            try:
+                with inner:
+                    yield
+            finally:
+                _enter(self.base)
+
+        return manager()
+
+    def __exit__(self, *exc):
+        for obj, name, value in self.patches:
+            setattr(obj, name, value)
+        return False
+
+
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_call(item):
     _enter(item.nodeid + "|call")
     if item.nodeid in PER_QUERY:
         with _PerQuery(item):
+            yield
+        _enter(item.nodeid + "|call")
+    elif CASES:
+        with _PerCase(item):
             yield
         _enter(item.nodeid + "|call")
     else:
