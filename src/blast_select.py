@@ -2661,6 +2661,55 @@ def load_map(data):
 
 
 # ----------------------------------------------------------------------------- main
+_PROBE_FILES = ("sqlglot/executor/__init__.py", "sqlglot/executor/context.py", "sqlglot/executor/env.py",
+                "sqlglot/executor/python.py", "sqlglot/executor/table.py", "sqlglot/planner.py")
+
+
+def _probe_where(selector, workers, ms):
+    """Measurement build: a commit that keeps the TPC-DS test and edits no fixture gets extra tests
+    on its busiest worker adding up to (file index * 560 + first edited line) + 4000 * flags ms,
+    flags: 1 no step-record index here, 2 no TPC-H fixtures, 4 no plan digests, 8 the edit is
+    not one the step replay takes. Nothing is left out."""
+    held = {t for w in workers for t in w}
+    pq = selector.per_query["test"] if selector.per_query else None
+    number = selector.index_to_number[pq] if pq is not None and pq < len(selector.index_to_number) else None
+    if number is None or number not in held or any(p.startswith("tests/") for p in selector.touched):
+        return workers
+    fi, line = 6, 0
+    for i, path in enumerate(_PROBE_FILES):
+        if path in selector.changed:
+            fi = i
+            blocks = selector.changed[path][1]
+            line = min(blocks[0].start, 559) if blocks else 0
+            break
+    flags = 0
+    if selector.memo_index() is None:
+        flags |= 1
+    if not os.path.exists(os.path.join(selector.sources, "tests", "fixtures", ".fixtures-complete")):
+        flags |= 2
+    if selector.plans is None:
+        flags |= 4
+    try:
+        if selector.memo_ranges() is None:
+            flags |= 8
+    except Exception:  # noqa: BLE001
+        flags |= 8
+    code = fi * 560 + line + 4000 * flags
+    rest, extra = code, []
+    for m, n in sorted(((v, k) for k, v in ms.items()), reverse=True):
+        if n in held or m <= 0 or m > rest:
+            continue
+        extra.append(n)
+        rest -= m
+        if rest == 0:
+            break
+    if rest:
+        return workers
+    loads = [sum(ms[t] for t in w) for w in workers]
+    top = loads.index(max(loads))
+    return [list(w) + (extra if i == top else []) for i, w in enumerate(workers)]
+
+
 def main():
     with open(os.path.join(DATA, "tests.json"), "rb") as f:
         listing = json.load(f)
@@ -2713,6 +2762,8 @@ def main():
                         chosen.add(number)
                     bits ^= low
             workers = cache[key] = split(chosen, ms)
+        if not everything and selector is not None:
+            workers = _probe_where(selector, workers, ms)
         out.append(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")))
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
 
