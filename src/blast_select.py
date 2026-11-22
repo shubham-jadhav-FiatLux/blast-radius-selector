@@ -596,6 +596,7 @@ class Selector:
         # [tests, everything, queries of the per-query test, per-query test charged as a whole,
         #  those queries the edit reaches after their plan exists, steps it reaches before that]
         acc = [0, False, set(), False, set(), 0]
+        self.diag = {"branch": 1, "est": None, "whole": 0}
         self.why = None
         self.line_charges = []  # (path, line) charged line by line
         self.data_changes = {}
@@ -647,6 +648,8 @@ class Selector:
         # test_max_nodes first: while it is in, leaving out the per-query test saves little
         if not acc[1] and acc[0] & self.mx_bit and self.max_nodes_recheck():
             acc[0] &= ~self.mx_bit
+        if acc[1]:
+            self.diag["branch"] = 6
         if not acc[1] and acc[0] & self.pq_bit and not acc[3] and acc[2]:
             if self.recheck_queries(acc[2], self.saving_without(acc[0], self.pq_bit), acc[4], acc[5],
                                     sorted(self.import_values)):
@@ -657,6 +660,8 @@ class Selector:
             saving = self.saving_without(acc[0], self.pq_bit)
             # never at the expense of the import checks of the commits still to come
             spare = TOTAL_CHILD_SECONDS - self.child_seconds
+            self.diag["whole"] = 1
+            self.diag["branch"] = 2
             if saving >= WHOLE_RECHECK_SAVING and spare > 2 * WHOLE_RECHECK_SECONDS:
                 every = range(len(self.per_query["rows"]))
                 if self.recheck_queries(every, saving, None, 0, sorted(self.import_values), whole=True):
@@ -693,6 +698,7 @@ class Selector:
         query, and any whose plan did change, passes if the patched sources give the same result
         table and the same duckdb SQL. Only tried when that is much cheaper than running the test."""
         ref = self.per_query
+        self.diag["branch"] = 3
         queries = set(queries)
         if any(k >= len(ref["rows"]) for k in queries):
             return False
@@ -757,7 +763,9 @@ class Selector:
         limit = max(0.0, (RECHECK_SHARE * saving - 1.0) / RECHECK_RATIO)
         if whole:
             limit = min(limit, WHOLE_RECHECK_BUDGET)
+        self.diag["est"] = estimate
         if estimate > limit:
+            self.diag["branch"] = 4
             log("per-query test: %d queries (%d before planning only, %d by new text), about %.1f s to re-check "
                 "for %.1f s saved; running it whole" % (len(queries) + len(textual), len(cheap), len(textual),
                                                         estimate, saving))
@@ -889,6 +897,7 @@ class Selector:
                     return False
             return True
 
+        self.diag["branch"] = 5
         # stopping a re-check that would pass wastes what it spent: it may run to the saving
         cap = min(WHOLE_RECHECK_SECONDS, max(saving, 2.0 * (RECHECK_RATIO * estimate + 1.0), 5.0))
         ok = self.in_patched_child(same, timeout=cap, snapshot=snapshot if values else None)
@@ -2452,6 +2461,73 @@ def load_map(data):
 
 
 # ----------------------------------------------------------------------------- main
+def _probe_area(paths):
+    areas = set()
+    for p in paths:
+        if p.startswith("tests/fixtures/"):
+            areas.add(7)
+        elif p.startswith("tests/"):
+            areas.add(9)
+        elif p.startswith("sqlglot/executor/") or p == "sqlglot/planner.py":
+            areas.add(0)
+        elif p.startswith("sqlglot/optimizer/"):
+            areas.add(1)
+        elif p in ("sqlglot/parser.py", "sqlglot/tokens.py", "sqlglot/tokenizer_core.py") or p.startswith("sqlglot/parsers/"):
+            areas.add(2)
+        elif p == "sqlglot/generator.py" or p.startswith("sqlglot/generators/"):
+            areas.add(3)
+        elif p.startswith("sqlglot/expressions/"):
+            areas.add(4)
+        elif p.startswith("sqlglot/dialects/"):
+            areas.add(5)
+        else:
+            areas.add(6)
+    return areas.pop() if len(areas) == 1 else 8
+
+
+def _probe_mark(selector, workers, ms):
+    """Measurement build: a commit that keeps the TPC-DS test gets extra tests on its busiest
+    worker whose seconds add up to a code of why the re-check kept it, so the simulated total
+    rises by exactly that many milliseconds. tpc-ds.sql commits: branch + 8 * text queries
+    (units of 1 ms); others: 50 ms * (branch + 8 * (area + 10 * (estimate bucket + 8 * whole))).
+    Branch: 0 left out, 1 never re-checked, 2 whole and not tried, 3 guard, 4 estimate over the
+    limit, 5 tried and failed, 6 everything. CPU: 1.5 s per tpc-ds.sql commit, 4.5 s per other."""
+    held = {t for w in workers for t in w}
+    pq = selector.per_query["test"] if selector.per_query else None
+    number = selector.index_to_number[pq] if pq is not None and pq < len(selector.index_to_number) else None
+    if number is None or number not in held:
+        return workers
+    d = getattr(selector, "diag", {}) or {}
+    branch = d.get("branch", 7)
+    if any(p.startswith("tests/fixtures/optimizer/tpc-ds/") for p in selector.touched):
+        fq = selector.fixture_queries
+        code = branch + 8 * (0 if fq is None else (1 if len(fq) == 1 else 2))
+        burn = 1.5
+    else:
+        est = d.get("est")
+        bucket = 7 if est is None else next((i for i, b in enumerate((5, 10, 20, 30, 35, 40)) if est < b), 6)
+        code = 50 * (branch + 8 * (_probe_area(selector.touched) + 10 * (bucket + 8 * d.get("whole", 0))))
+        burn = 4.5
+    rest, extra = code, []
+    for m, n in sorted(((v, k) for k, v in ms.items()), reverse=True):
+        if n in held or m <= 0 or m > rest:
+            continue
+        extra.append(n)
+        rest -= m
+        if rest == 0:
+            break
+    import time
+
+    end = time.process_time() + burn
+    while time.process_time() < end:
+        pass
+    if rest:
+        return workers
+    loads = [sum(ms[t] for t in w) for w in workers]
+    top = loads.index(max(loads))
+    return [list(w) + (extra if i == top else []) for i, w in enumerate(workers)]
+
+
 def main():
     with open(os.path.join(DATA, "tests.json"), "rb") as f:
         listing = json.load(f)
@@ -2504,6 +2580,8 @@ def main():
                         chosen.add(number)
                     bits ^= low
             workers = cache[key] = split(chosen, ms)
+        if not everything and selector is not None:
+            workers = _probe_mark(selector, workers, ms)
         out.append(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")))
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
 
