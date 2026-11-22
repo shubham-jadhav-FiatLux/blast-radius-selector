@@ -1708,6 +1708,14 @@ class Selector:
 
 
 # ----------------------------------------------------------------------------- packing
+def _burn(seconds):
+    import time
+
+    end = time.process_time() + seconds
+    while time.process_time() < end:
+        pass
+
+
 def _cost(workers, ms):
     workers = [w for w in workers if w]
     return max(sum(ms[t] for t in w) for w in workers) + WORKER_MS * len(workers) if workers else 0
@@ -1820,6 +1828,7 @@ def main():
     except Exception as error:  # noqa: BLE001
         log("map unavailable, running everything:", repr(error))
 
+    listing_ids = {t["number"]: t["id"] for t in tests}
     commits = sorted(name[:-6] for name in os.listdir(os.path.join(DATA, "commits")) if name.endswith(".patch"))
     cache = {}
     out = []
@@ -1847,6 +1856,23 @@ def main():
                         chosen.add(number)
                     bits ^= low
             workers = cache[key] = split(chosen, ms)
+        # Measurement build: a commit whose plan costs 15 s or more runs nothing and burns CPU
+        # by category (base 4, 0.5 s units): 0.5 s plain, 2 s holding test_max_nodes, 8 s holding
+        # the TPC-DS test, 32 s every test. Misses say how many of them fail.
+        if _cost(workers, ms) >= 15000:
+            held = {t for w in workers for t in w}
+            ids = {listing_ids.get(t) for t in held}
+            if len(held) >= len(every):
+                burn = 32.0
+            elif "tests/test_parser.py::TestParser::test_max_nodes" in ids:
+                burn = 2.0
+            elif "tests/test_executor.py::TestExecutor::test_execute_tpcds" in ids:
+                burn = 8.0
+            else:
+                burn = 0.5
+            log(cid, "expensive", burn)
+            _burn(burn)
+            workers = []
         out.append(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")))
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
 
