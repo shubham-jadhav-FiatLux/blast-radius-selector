@@ -48,6 +48,12 @@ WHOLE_RECHECK_SAVING = 10.0  # a re-check of every query, only for at least this
 WHOLE_RECHECK_SECONDS = 30.0  # the child doing it
 WHOLE_RECHECK_BUDGET = 40.0  # its estimate (build-time seconds, about twice the actual cost)
 PER_QUERY_BUDGET = 16.0  # most seconds of re-checking ever worth trying instead of a 21 s test
+# A re-check stops at the first query that comes out different, so a failing one costs about a
+# second; one that passes costs about RECHECK_RATIO of its build-time estimate. It is tried when
+# that is at most RECHECK_SHARE of what leaving the test out saves.
+RECHECK_RATIO = 0.5
+RECHECK_SHARE = 0.8
+TEXT_QUERY_MAX = 6  # most TPC-DS queries with a changed fixture text that are re-checked by it
 CHILD_SECONDS = 20.0  # longest any single patched child may run before it is killed
 IMPORT_SECONDS = 8.0  # an import check normally takes well under a second
 TOTAL_CHILD_SECONDS = 100.0  # all patched children together, for the whole batch
@@ -591,6 +597,7 @@ class Selector:
         self.why = None
         self.line_charges = []  # (path, line) charged line by line
         self.data_changes = {}
+        self.fixture_queries = None  # {query: (meta, sql)} whose text an edit of tpc-ds.sql changed
         self.other_bits = 0  # tests charged any other way
         self._line_path = None
         self.import_check = set()
@@ -694,6 +701,8 @@ class Selector:
                 continue
             if p in EXECUTOR_FIXTURES and self.executor_fixture_same(p):
                 continue  # TestExecutor loads it, but nothing the per-query test uses changed
+            if p == EXECUTOR_FIXTURES[0] and self.fixture_queries is not None:
+                continue  # the queries whose text changed are re-checked by their new text
             # ... with the pinned fixtures and data too: not for a file the test reads
             sid = self.reads.get(p, NO_TESTS)
             if p.endswith(".py") or sid == GLOBAL or (sid >= 0 and self.sets[sid] & self.pq_bit):
@@ -703,6 +712,8 @@ class Selector:
                 d = self.reads.get("/".join(parts[:i]) + "/", NO_TESTS)
                 if d == GLOBAL or (d >= 0 and self.sets[d] & self.pq_bit):
                     return False
+        textual = {k: self.fixture_queries[k] for k in queries if k in (self.fixture_queries or {})}
+        queries -= set(textual)
         if self.plans is None or back is None:
             full = set(queries)
         else:
@@ -722,10 +733,22 @@ class Selector:
             return cost
 
         estimate = run_cost(full) + sum(plans["seconds"][k] if replay[k] is None else replay[k] for k in cheap)
-        limit = WHOLE_RECHECK_BUDGET if whole else min(PER_QUERY_BUDGET, 0.6 * saving)
+        text_run = [k for k, (meta, _sql) in textual.items() if meta.get("execute")]
+        if text_run:
+            # run by sqlglot's executor and by duckdb (views, pandas), on the pinned tables
+            estimate += sum(ref["seconds"][k] or 0.5 for k in text_run) + 4.0
+            if not any(ref["rows"][k] is not None for k in full):
+                estimate += ref["load"]
+        estimate += 0.05 * len(textual)
+        # a failing re-check stops at the first query that differs: the price that matters is
+        # that of one that passes, about RECHECK_RATIO of the estimate
+        limit = max(0.0, (RECHECK_SHARE * saving - 1.0) / RECHECK_RATIO)
+        if whole:
+            limit = min(limit, WHOLE_RECHECK_BUDGET)
         if estimate > limit:
-            log("per-query test: %d queries (%d before planning only), about %.1f s to re-check for %.1f s saved; "
-                "running it whole" % (len(queries), len(cheap), estimate, saving))
+            log("per-query test: %d queries (%d before planning only, %d by new text), about %.1f s to re-check "
+                "for %.1f s saved; running it whole" % (len(queries) + len(textual), len(cheap), len(textual),
+                                                        estimate, saving))
             return False
         if not os.path.isdir(os.path.join(self.sources, "tests", "fixtures", "optimizer", "tpc-ds")):
             return False
@@ -807,6 +830,16 @@ class Selector:
                     log("per-query test: duckdb check of query", k, "failed:", repr(error)[:120])
                     return False
 
+            for k in sorted(textual, key=lambda q: ref["seconds"][q] or 0.0):
+                meta_k, sql_k = textual[k]
+                try:
+                    within(3 * (ref["seconds"][k] or 0.5) + 6.0, module.text_passes, self.sources, meta_k, sql_k)
+                except OverTime:
+                    log("per-query test: query", k, "with its new text runs far longer")
+                    return False
+                except Exception as error:  # noqa: BLE001
+                    log("per-query test: query", k, "with its new text fails:", repr(error)[:160])
+                    return False
             fronts = set(cheap) - set(by_points)
             if by_points:
                 with open(POINTS_PATH, "rb") as f:
@@ -834,11 +867,13 @@ class Selector:
                     return False
             return True
 
-        cap = WHOLE_RECHECK_SECONDS if whole else min(CHILD_SECONDS, 3 * limit + 3)
+        # stopping a re-check that would pass wastes what it spent: it may run to the saving
+        cap = min(WHOLE_RECHECK_SECONDS, max(saving, 2.0 * (RECHECK_RATIO * estimate + 1.0), 5.0))
         ok = self.in_patched_child(same, timeout=cap, snapshot=snapshot if values else None)
         if ok:
-            log("per-query test passes for queries", sorted(queries),
-                "(%d by checkpoints, %d by plan) - left out" % (len(by_points), len(cheap) - len(by_points)))
+            log("per-query test passes for queries", sorted(set(queries) | set(textual)),
+                "(%d by checkpoints, %d by plan, %d by new text) - left out"
+                % (len(by_points), len(cheap) - len(by_points), len(textual)))
         return ok
 
     def reducible(self, bits):
@@ -1418,6 +1453,13 @@ class Selector:
         self.data_changes[path] = ch
         narrow = self.class_data_answer(path, ch)
         self.charge(acc, self.reads.get(path, NO_TESTS) if narrow is None else narrow)
+        if narrow is not None and self.fixture_queries and path == EXECUTOR_FIXTURES[0]:
+            ks = set(self.fixture_queries)
+            acc[0] |= self.pq_bit
+            self.other_bits |= self.pq_bit
+            acc[2].update(ks)
+            acc[4].update(ks)  # run whole, by their new text
+            acc[5] |= tpcds_check.STEP_BIT["pre"]
         if ch.old_path and ch.old_path != path:
             self.charge(acc, self.reads.get(ch.old_path, NO_TESTS))
         if ch.status in ("new", "delete", "rename"):
@@ -1570,9 +1612,17 @@ class Selector:
             log(path, "could not be compared:", repr(error))
             return None
         if self.pq_bit and sid >= 0 and self.sets[sid] & self.pq_bit and loader == "load_sql_fixture_pairs":
-            if len(before) == len(after) and all(a[:2] == b[:2] for a, b in zip(before, after)):
-                log(path, "changes no query the per-query test runs")
-                return sid_without_pq
+            if len(before) == len(after):
+                changed = {k: (b[0], b[1]) for k, (a, b) in enumerate(zip(before, after)) if a[:2] != b[:2]}
+                if not changed:
+                    log(path, "changes no query the per-query test runs")
+                    return sid_without_pq
+                if path == EXECUTOR_FIXTURES[0] and len(changed) <= TEXT_QUERY_MAX:
+                    # those queries alone run differently: data_change charges the per-query
+                    # test with them, and the re-check runs them by their new text
+                    log(path, "changes the text of queries", sorted(changed), "of the per-query test")
+                    self.fixture_queries = changed
+                    return sid_without_pq
         return sid
 
     def module_level(self, path, info, acc):

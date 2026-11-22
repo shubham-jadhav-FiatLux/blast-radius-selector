@@ -624,7 +624,7 @@ def write_plans(root, target):
 _DUCK = {}
 
 
-def duck_digest(root, sql):
+def duck_digest(root, sql, raw=False):
     """A digest of what duckdb returns for ``transpile(sql, write="duckdb")`` on the TPC-DS views,
     built as TestExecutor.setUpClass builds them. Equal for the patched and the pinned SQL means
     the test's comparison of the two sides is what it was, the executor's side being unchanged."""
@@ -653,7 +653,38 @@ def duck_digest(root, sql):
             )
         _DUCK["conn"] = conn
     frame = conn.execute(transpile(sql, write="duckdb")[0]).fetchdf()
+    if raw:
+        return frame
     return _digest((list(frame.columns), [tuple(repr(v) for v in row) for row in frame.itertuples(index=False)]))
+
+
+def text_passes(root, meta, sql):
+    """test_execute_tpcds for one query whose text in the fixture the patch changed, as the test
+    runs it: parsed (and pickled to the pool) like every query, and when its meta says execute,
+    run by sqlglot's executor and compared with duckdb's answer for the same text the way
+    subtestHelper compares them. Raises where the test would fail; True otherwise."""
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from sqlglot import find_tables, parse_one
+    from sqlglot.executor import execute
+    from tests.helpers import FIXTURES_DIR, TPCDS_SCHEMA
+
+    expression = pickle.loads(pickle.dumps(parse_one(sql)))
+    if not meta.get("execute"):
+        return True  # mp_execute returns None for it: nothing is compared
+    if "tables" not in _LOADED:
+        _LOADED["tables"] = pickle.loads(pickle.dumps((TPCDS_SCHEMA, _tables(FIXTURES_DIR, TPCDS_SCHEMA))))
+    schema, tables = _LOADED["tables"]
+    found = {t.name: tables[t.name] for t in find_tables(expression)}
+    table = pickle.loads(pickle.dumps(execute(expression, schema=schema, tables=found)))
+    a = duck_digest(root, sql, raw=True)
+    import numpy as np
+    import pandas as pd
+    from pandas.testing import assert_frame_equal
+
+    b = pd.DataFrame(((np.nan if c is None else c for c in r) for r in table.rows), columns=table.columns)
+    assert_frame_equal(a, b, check_dtype=False, check_index_type=False)
+    return True
 
 
 def write_duck(root, target):
