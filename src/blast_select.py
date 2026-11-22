@@ -55,6 +55,15 @@ PER_QUERY_BUDGET = 16.0  # most seconds of re-checking ever worth trying instead
 RECHECK_RATIO = 0.5
 RECHECK_SHARE = 0.8
 TEXT_QUERY_MAX = 6  # most TPC-DS queries with a changed fixture text that are re-checked by it
+# Lines of sqlglot.executor.execute() that test_execute_tpcds never runs: the schema inference
+# under `if not schema:` (the test always hands its workers TPCDS_SCHEMA) and the raise of the
+# table-args check. The TPC-DS stage profile counts every line of execute() for every query, so
+# the map charges that test for them; the main profile never saw it run one. An edit confined to
+# them, in place and at the same indentation (so it stays in its branch), cannot reach the test.
+PQ_NEVER_RUN = {
+    "sqlglot/executor/__init__.py": (frozenset(range(56, 69)) | {73},
+                                     {55: "if not schema:", 72: "if tables_.supported_table_args and"}),
+}
 CHILD_SECONDS = 20.0  # longest any single patched child may run before it is killed
 IMPORT_SECONDS = 8.0  # an import check normally takes well under a second
 TOTAL_CHILD_SECONDS = 100.0  # all patched children together, for the whole batch
@@ -601,6 +610,7 @@ class Selector:
         self.data_changes = {}
         self.fixture_queries = None  # {query: (meta, sql)} whose text an edit of tpc-ds.sql changed
         self.other_bits = 0  # tests charged any other way
+        self._strip_pq = False  # charging lines the per-query test never runs (PQ_NEVER_RUN)
         self._line_path = None
         self.import_check = set()
         self.touched = set()
@@ -1487,7 +1497,7 @@ class Selector:
 
     def charge(self, acc, sid, queries=None, back=None, steps=0):
         if sid >= 0 and not getattr(self, "_in_line", False):
-            self.other_bits |= self.sets[sid]
+            self.other_bits |= self.sets[sid] & ~(self.pq_bit if self._strip_pq else 0)
         self._charge(acc, sid, queries, back, steps)
 
     def _charge(self, acc, sid, queries=None, back=None, steps=0):
@@ -1499,6 +1509,8 @@ class Selector:
             self._mark(acc, self._charge_label())
         elif sid >= 0:
             bits = self.sets[sid]
+            if self._strip_pq:
+                bits &= ~self.pq_bit
             acc[0] |= bits
             if self.pq_bit and bits & self.pq_bit:
                 if queries is None:
@@ -2246,6 +2258,23 @@ class Selector:
         return tuple(q for q in queries if q in after)
 
     def python_change(self, path, info, blocks, acc):
+        try:
+            return self._python_change(path, info, blocks, acc)
+        finally:
+            self._strip_pq = False
+
+    def never_run(self, path, info):
+        """PQ_NEVER_RUN's lines of this file, when the pinned source has the branches they belong to."""
+        entry = PQ_NEVER_RUN.get(path)
+        if entry is None or not self.pq_bit:
+            return None
+        lines = self.source_lines(path, info)
+        if lines is None or any(ln > len(lines) or not lines[ln - 1].strip().startswith(text)
+                                for ln, text in entry[1].items()):
+            return None
+        return entry[0]
+
+    def _python_change(self, path, info, blocks, acc):
         kind = info["kind"]
         n = len(kind)
         self.changed[path] = (info, blocks)
@@ -2267,8 +2296,15 @@ class Selector:
             return
         sets = info["sets"]
         self.binding_changes(path, info, live, acc)
+        never = self.never_run(path, info)
         for b in live:
             pairs = len(b.old) == len(b.new)
+            self._strip_pq = bool(
+                never and b.old and pairs and all(ln in never for ln in range(b.start, b.start + len(b.old)))
+                and all(_lead(o) == _lead(nw) for o, nw in zip(b.old, b.new) if o.strip() and nw.strip())
+                and all(kind[ln - 1] in (RUNTIME, NONE) for ln in range(b.start, b.start + len(b.old))))
+            if self._strip_pq:
+                log(path, "edit confined to lines the per-query test never runs")
             if b.old:
                 lines = range(b.start, b.start + len(b.old))
             else:
@@ -2376,6 +2412,10 @@ class Selector:
                 self.unmodeled_edit(path, info, acc)
             if acc[1]:
                 return
+
+
+def _lead(text):
+    return text[: len(text) - len(text.lstrip())]
 
 
 # ----------------------------------------------------------------------------- packing
