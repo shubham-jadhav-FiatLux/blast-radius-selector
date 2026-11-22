@@ -1084,6 +1084,8 @@ class Selector:
                 return None
             defs = [(n.lineno, n.end_lineno, n.col_offset) for n in ast.walk(tree)
                     if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.end_lineno]
+            heads = [(n.body[0].lineno - 1, n.end_lineno, n.col_offset) for n in ast.walk(tree)
+                     if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.end_lineno and n.body]
             # the executor's own loop: the replay runs a copy of it, so an edit there is not replayed
             loop = [(f.lineno, f.end_lineno) for c in tree.body if isinstance(c, ast.ClassDef) and c.name == "PythonExecutor"
                     for f in c.body if isinstance(f, ast.FunctionDef) and f.name in ("execute", "_execute", "context")] \
@@ -1100,13 +1102,18 @@ class Selector:
                 indent = min((len(t) - len(t.lstrip()) for t in code), default=None)
                 if b.old:
                     first, last = b.start, b.start + len(b.old) - 1
+                    body = in_body(first, last, indent)
+                    seen = range(first, last + 1)
                 else:
                     first, last = b.start - 1, b.start  # added between these two lines
-                if not in_body(first, last, indent) or any(lo <= last and first <= hi for lo, hi in loop):
+                    # (also as the first statement of a body, right after its def line)
+                    body = indent is not None and any(h <= first and last <= hi and indent > col for h, hi, col in heads)
+                    seen = (last,)
+                if not body or any(lo <= last and first <= hi for lo, hi in loop):
                     return None
                 # a body that ran while its module was imported (a helper building a table)
                 # left what it computed in objects no step's record shows
-                if any(1 <= ln <= len(kind) and kind[ln - 1] in (IMPORT, MIXED) for ln in range(first, last + 1)):
+                if any(1 <= ln <= len(kind) and kind[ln - 1] in (IMPORT, MIXED) for ln in seen):
                     return None
                 spans.append((first, last))
             out[path] = spans
