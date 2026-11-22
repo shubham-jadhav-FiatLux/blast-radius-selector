@@ -38,9 +38,11 @@ import tpcds_check  # noqa: E402
 
 TOOL = 3  # a sys.monitoring tool id no debugger, coverage tool or profiler uses
 INDEX = "index.marshal"
-# what builds the executor's input before any step runs: execute() and the tables it is given.
-# An edit there can change what every step reads without running in any step.
-AROUND = ("sqlglot/executor/__init__.py", "sqlglot/executor/table.py")
+# execute() and the tables it hands the executor run before any step: an edit there could change
+# what every step reads without running in any step. A replay checks that the executor got the
+# same table objects (and no other environment) as the record's run, and the steps' keys check
+# the plan; otherwise the query runs as it is.
+AROUND = ()
 
 
 def _blob_digest(blob):
@@ -273,6 +275,11 @@ class _Fallback(Exception):
     pass
 
 
+class PlanChanged(Exception):
+    """A replayed query's plan is not the recorded one: nothing to replay, and running every
+    query to its end is what the replay was priced against; the re-check gives up."""
+
+
 def dirty_codes(codes, ranges):
     """Ids of the recorded code objects whose lines meet any of ``ranges`` ({path: [(lo, hi)]})."""
     out = set()
@@ -296,6 +303,7 @@ class Replay:
         self.dirty = dirty_codes(index["codes"], ranges)
         self.off = bool(self.dirty & set(index["frame"])) or any(p in AROUND for p in ranges)
         self.active = None
+        self.expected = None  # {name: table} the active query's executor must be given
         self.busy = False
         self.ran = 0
         self.kept = 0
@@ -309,10 +317,23 @@ class Replay:
         from sqlglot.executor.python import PythonExecutor
 
         original = PythonExecutor._execute
+        original_init = PythonExecutor.__init__
         replay = self
 
+        def __init__(executor, *args, **kwargs):
+            original_init(executor, *args, **kwargs)
+            # what the record's run handed the executor: the loaded tables themselves, no env
+            tables = kwargs.get("tables", args[1] if len(args) > 1 else None)
+            env = kwargs.get("env", args[0] if args else None)
+            mapping = getattr(tables, "mapping", None)
+            expected = replay.expected
+            executor._replay_ok = (
+                env is None and expected is not None and isinstance(mapping, dict)
+                and set(mapping) == set(expected) and all(mapping[n] is expected[n] for n in expected))
+
         def _execute(executor, plan):
-            if replay.active is None or replay.busy or executor._outer_scope is not None:
+            if (replay.active is None or replay.busy or executor._outer_scope is not None
+                    or not getattr(executor, "_replay_ok", False)):
                 return original(executor, plan)
             replay.busy = True
             try:
@@ -324,6 +345,7 @@ class Replay:
             return original(executor, plan)
 
         PythonExecutor._execute = _execute
+        PythonExecutor.__init__ = __init__
 
     def loop(self, executor, plan):
         k = self.active
@@ -342,6 +364,8 @@ class Replay:
                 got = contexts[node] = executor.context(pickle.loads(zlib.decompress(blobs[keys[node]])))
             return got
 
+        if keys[plan.root] not in steps:
+            raise PlanChanged(k)
         for node in order:
             meta = steps.get(keys[node])
             if (meta is not None and len(set(meta[2])) == 1 and not self.dirty.intersection(meta[0])

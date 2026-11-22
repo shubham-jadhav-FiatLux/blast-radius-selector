@@ -877,8 +877,13 @@ class Selector:
                     except Exception as error:  # noqa: BLE001
                         log("per-query test: no step replay:", repr(error)[:120])
                         steps_replay = None
+                # with step records, the check is priced by what replaying them costs: one whose plans
+                # come out different (nothing to replay) stops early instead of running to the saving
+                budget = 3 * run_cost(full) + 1.0
+                if steps_replay is not None:
+                    budget = min(budget, max(4.0, 2.5 * RECHECK_RATIO * full_cost + 2.0))
                 try:
-                    got = within(3 * run_cost(full) + 1.0, module.fingerprints, self.sources, sorted(full), steps_replay)
+                    got = within(budget, module.fingerprints, self.sources, sorted(full), steps_replay)
                 except OverTime:
                     log("per-query test: queries", sorted(full), "run far longer with this patch")
                     return False
@@ -916,11 +921,16 @@ class Selector:
                 return None
             defs = [(n.lineno, n.end_lineno, n.col_offset) for n in ast.walk(tree)
                     if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.end_lineno]
+            # the executor's own loop: the replay runs a copy of it, so an edit there is not replayed
+            loop = [(f.lineno, f.end_lineno) for c in tree.body if isinstance(c, ast.ClassDef) and c.name == "PythonExecutor"
+                    for f in c.body if isinstance(f, ast.FunctionDef) and f.name in ("execute", "_execute", "context")] \
+                if path == "sqlglot/executor/python.py" else []
 
             def in_body(first, last, indent):
                 # lines first..last lie in a def's body, and added code is indented inside it
                 return any(lo < first and last <= hi and (indent is None or indent > col) for lo, hi, col in defs)
 
+            kind = info["kind"]
             spans = []
             for b in blocks:
                 code = [t for t in b.new if t.strip() and not t.lstrip().startswith("#")]
@@ -929,7 +939,11 @@ class Selector:
                     first, last = b.start, b.start + len(b.old) - 1
                 else:
                     first, last = b.start - 1, b.start  # added between these two lines
-                if not in_body(first, last, indent):
+                if not in_body(first, last, indent) or any(lo <= last and first <= hi for lo, hi in loop):
+                    return None
+                # a body that ran while its module was imported (a helper building a table)
+                # left what it computed in objects no step's record shows
+                if any(1 <= ln <= len(kind) and kind[ln - 1] in (IMPORT, MIXED) for ln in range(first, last + 1)):
                     return None
                 spans.append((first, last))
             out[path] = spans

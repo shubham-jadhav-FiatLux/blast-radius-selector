@@ -577,6 +577,7 @@ def fingerprints(root, queries, replay=None):
         found = {t.name: tables[t.name] for t in find_tables(expression)}
         if replay is not None:
             replay.active = k if replay.usable(k) else None
+            replay.expected = found
         try:
             table = pickle.loads(pickle.dumps(execute(expression, schema=schema, tables=found)))
         finally:
