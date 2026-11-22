@@ -1129,7 +1129,7 @@ class Selector:
 
             try:
                 with open(os.path.join(MEMO_DIR, tpcds_memo.INDEX), "rb") as f:
-                    self._memo_index = marshal.load(f)
+                    self._memo_index = marshal.loads(f.read())
             except (OSError, ValueError, EOFError):
                 self._memo_index = None
         return self._memo_index

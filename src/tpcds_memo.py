@@ -148,12 +148,35 @@ def ser(v):
     raise _Unsupported(type(v).__name__)
 
 
+def plan_nocopy(expression):
+    """Plan(expression) without its first deep copy of the whole tree, for an expression that
+    nothing else holds (one just rebuilt from its record): the same steps from the same tree.
+    Used only where the build checked that both give the same step keys, and only while the
+    edit leaves the planner as it was (it ran before the plan existed, see Replay.front_plan)."""
+    from sqlglot.planner import Plan, Step
+
+    plan = Plan.__new__(Plan)
+    plan.expression = expression
+    with_ = expression.args.get("with_")
+    plan.ctes = with_.copy() if with_ is not None else None
+    plan.root = Step.from_expression(plan.expression)
+    plan._dag = {}
+    return plan
+
+
+_CLASSES = {}  # (module, qualname): (module object, class), valid while that module is the one imported
+
+
 def _cls(module, qualname):
+    got = _CLASSES.get((module, qualname))
+    if got is not None and sys.modules.get(module) is got[0]:
+        return got[1]
     import importlib
 
-    obj = importlib.import_module(module)
+    obj = owner = importlib.import_module(module)
     for part in qualname.split("."):
         obj = getattr(obj, part)
+    _CLASSES[(module, qualname)] = (owner, obj)
     return obj
 
 
@@ -391,7 +414,7 @@ class Replay:
         self.dir = directory
         if index is None:
             with open(os.path.join(directory, INDEX), "rb") as f:
-                index = marshal.load(f)
+                index = marshal.loads(f.read())
         self.queries = index["queries"]
         self.dirty = dirty_codes(index["codes"], ranges)
         self.off = bool(self.dirty & set(index["frame"])) or any(p in AROUND for p in ranges)
@@ -408,7 +431,7 @@ class Replay:
         got = self._blobs.get(k)
         if got is None:
             with open(os.path.join(self.dir, "q%d.marshal" % k), "rb") as f:
-                got = self._blobs[k] = marshal.load(f)
+                got = self._blobs[k] = marshal.loads(f.read())
         return got
 
     def front_plan(self, k):
@@ -419,6 +442,14 @@ class Replay:
                 or self.dirty.intersection(q.get("duckc", ()))):
             return None
         return deser(marshal.loads(self.blobs(k)["__opt__"]))
+
+    def plan(self, k, expression):
+        """The plan of query k from its rebuilt optimized expression (see front_plan)."""
+        if self.queries[k].get("nocopy"):
+            return plan_nocopy(expression)
+        from sqlglot.planner import Plan
+
+        return Plan(expression)
 
     def usable(self, k):
         q = self.queries.get(k)
@@ -516,7 +547,7 @@ def self_check(root, target):
     """Replays every recorded query with nothing edited; a query whose replay does not give the
     pinned result is marked not replayable. False when the records are unusable as a whole."""
     with open(os.path.join(target, INDEX), "rb") as f:
-        index = marshal.load(f)
+        index = marshal.loads(f.read())
     replay = Replay(target, {}, index)
     replay.install()
     ks = sorted(k for k, q in index["queries"].items() if q["ok"])
@@ -538,6 +569,24 @@ def self_check(root, target):
     replay.force = False
     print("tpcds_memo: %d of %d queries rebuilt from their optimized form" % (
         sum(1 for k in good if index["queries"][k]["opt"]), len(good)), file=sys.stderr)
+    # planning a rebuilt expression without copying it first must give the same steps
+    from sqlglot.planner import Plan
+
+    for k in good:
+        q = index["queries"][k]
+        q["nocopy"] = False
+        if not q["opt"]:
+            continue
+        try:
+            with open(os.path.join(target, "q%d.marshal" % k), "rb") as f:
+                blob = marshal.loads(f.read())["__opt__"]
+            a = sorted(_keys(_order(Plan(deser(marshal.loads(blob))))).values())
+            b = sorted(_keys(_order(plan_nocopy(deser(marshal.loads(blob))))).values())
+            q["nocopy"] = a == b
+        except Exception as error:  # noqa: BLE001
+            print("tpcds_memo: query", k, "plan check failed:", repr(error)[:160], file=sys.stderr)
+    print("tpcds_memo: %d queries planned without a copy" % sum(
+        1 for k in good if index["queries"][k].get("nocopy")), file=sys.stderr)
     with open(os.path.join(target, INDEX), "wb") as f:
         marshal.dump(index, f)
     print("tpcds_memo: %d queries replayable, %d replayed wrong; %d steps kept, %d run, %d fallbacks" % (

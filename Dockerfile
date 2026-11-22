@@ -18,10 +18,12 @@ COPY data/sqlglot-src.tar.xz /tmp/sqlglot-src.tar.xz
 # the image that will use them (a missing file only disables comparing plans), and so are the
 # executor's step records that let a re-check run only the steps an edit reaches. The TPC-H
 # tables TestExecutor loads are fetched from sqlglot at the pinned commit (checked by SHA-256),
-# so that class's tests can run here; without them those tests are kept as before.
+# so that class's tests can run here; without them those tests are kept as before. The TPC-DS
+# table rows the re-checks load are packed once here, so a check does not parse the files again.
 RUN python -c "import tarfile; tarfile.open('/tmp/sqlglot-src.tar.xz').extractall('/app/sqlglot-src', filter='data')" \
     && rm /tmp/sqlglot-src.tar.xz \
     && python -S -B /app/fetch_fixtures.py /app/sqlglot-src \
+    && python -S -B /app/tpcds_check.py --rows /app/sqlglot-src /app/tpcds_rows.marshal \
     && python -m compileall -q /app/sqlglot-src/sqlglot \
     && python -S -B /app/import_baseline.py /app/sqlglot-src /app/import_baseline.txt \
     && python -S -B /app/tpcds_check.py --plans /app/sqlglot-src /app/tpcds_plans.json \

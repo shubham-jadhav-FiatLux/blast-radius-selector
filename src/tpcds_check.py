@@ -18,6 +18,7 @@ import ast
 import csv
 import gzip
 import hashlib
+import marshal
 import os
 import pickle
 import sys
@@ -38,11 +39,54 @@ def _open(path):
     return open(path, encoding="utf-8", newline="")
 
 
+ROWS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tpcds_rows.marshal")
+
+
+def _rows(directory, table):
+    reader = csv.reader(_open(f"{directory}{table}.csv.gz"), delimiter="|")
+    rows = []
+    ctypes = []
+    next(reader)
+    for row in reader:
+        if not ctypes:
+            for v in row:
+                try:
+                    ctypes.append(type(ast.literal_eval(v)))
+                except (ValueError, SyntaxError):
+                    ctypes.append(str)
+        rows.append(tuple(None if (t is not str and v == "") else t(v) for t, v in zip(ctypes, row)))
+    return rows
+
+
+def write_rows(root, target):
+    """Packs the rows _tables reads from the TPC-DS files (pure Python values, no sqlglot code
+    involved), so that a check builds the tables without parsing the files again."""
+    from tests.helpers import FIXTURES_DIR, TPCDS_SCHEMA
+
+    directory = os.path.join(FIXTURES_DIR, "optimizer", "tpc-ds") + "/"
+    packed = {table: _rows(directory, table) for table in TPCDS_SCHEMA}
+    data = marshal.dumps(packed)
+    if marshal.loads(data) != packed:
+        print("tpcds_check: rows do not survive marshal; not written", file=sys.stderr)
+        return
+    with open(target, "wb") as f:
+        f.write(data)
+
+
 def _tables(fixtures, schema):
     # TestExecutor.setUpClass, without the duckdb half
     from sqlglot.executor.table import Table
 
     directory = os.path.join(fixtures, "optimizer", "tpc-ds") + "/"
+    packed = None
+    if os.path.exists(ROWS):
+        try:
+            with open(ROWS, "rb") as f:
+                packed = marshal.loads(f.read())
+        except (OSError, ValueError, EOFError):
+            packed = None
+    if packed is not None and set(packed) == set(schema):
+        return {table: Table(columns=columns, rows=packed[table]) for table, columns in schema.items()}
     tables = {}
     for table, columns in schema.items():
         reader = csv.reader(_open(f"{directory}{table}.csv.gz"), delimiter="|")
@@ -576,13 +620,13 @@ def fingerprints(root, queries, replay=None):
             # form is what parse_one and optimize give, and its duckdb SQL the recorded one
             from sqlglot.executor.python import PythonExecutor
             from sqlglot.executor.table import ensure_tables
-            from sqlglot.planner import Plan
 
             q = replay.queries[k]
             found = {name: tables[name] for name in q["found"]}
             replay.active, replay.expected = k, found
             try:
-                table = pickle.loads(pickle.dumps(PythonExecutor(tables=ensure_tables(found)).execute(Plan(rebuilt))))
+                plan = replay.plan(k, rebuilt)
+                table = pickle.loads(pickle.dumps(PythonExecutor(tables=ensure_tables(found)).execute(plan)))
             finally:
                 replay.active = None
             out[k] = (_digest((list(table.columns), [tuple(row) for row in table.rows])), q["duckd"])
@@ -742,6 +786,11 @@ def main():
         return
     if sys.argv[1] == "--duck":
         write_duck(sys.argv[2], sys.argv[3])
+        return
+    if sys.argv[1] == "--rows":
+        sys.path.insert(0, sys.argv[2])
+        os.chdir(sys.argv[2])
+        write_rows(sys.argv[2], sys.argv[3])
         return
     root, target = sys.argv[1], sys.argv[2]
     sys.path.insert(0, root)
