@@ -79,6 +79,10 @@ RERUN_SECONDS = 30.0
 RERUN_SPARE = 40.0  # child seconds kept for import checks
 RERUN_RETURN = 1.5  # run only when the schedule gets this many times cheaper than the run costs
 RERUN_PANDAS = ("tests/test_optimizer.py", "tests/test_executor.py")
+RERUN_CASES = False  # fixture tests on their reached cases: no gain on practice for the CPU
+FRESH_CHECK_SAVING = 1.0  # verify test_lazy_load only when leaving it out saves this much
+FRESH_SENSITIVE_RE = re.compile(r"\bimport\b|importlib|__import__|_try_load|get_or_raise|_classes|__getattr__")
+EXECUTOR_FIXTURES = ("tests/fixtures/optimizer/tpc-ds/tpc-ds.sql", "tests/fixtures/optimizer/tpc-h/tpc-h.sql")
 RERUN_REGISTRY = ("sqlglot/dialects/dialect.py", "sqlglot/dialects/__init__.py")
 RERUN_DIRS = ("tests/dialects/",)
 RERUN_UNAVAILABLE = ("tests/dialects/test_bigquery.py",)  # needs pytz
@@ -586,6 +590,7 @@ class Selector:
         acc = [0, False, set(), False, set(), 0]
         self.why = None
         self.line_charges = []  # (path, line) charged line by line
+        self.data_changes = {}
         self.other_bits = 0  # tests charged any other way
         self._line_path = None
         self.import_check = set()
@@ -615,8 +620,15 @@ class Selector:
                 log("import-time edits nothing narrower covers, in", sorted(self.unmodeled), "- running everything")
                 self._mark(acc, "unmodeled")
             if self.core is None or any(_module_of(p) in self.core for p in self.import_check):
-                for index in self.fresh:  # these import sqlglot in a fresh interpreter
-                    acc[0] |= 1 << index
+                if self.fresh_reachable():
+                    for index in self.fresh:  # these import sqlglot in a fresh interpreter
+                        acc[0] |= 1 << index
+        fresh_bits = sum(1 << i for i in self.fresh)
+        if not acc[1] and acc[0] & fresh_bits and self.saving_without(acc[0], fresh_bits) >= FRESH_CHECK_SAVING \
+                and self.fresh_check_passes():
+            acc[0] &= ~fresh_bits
+            if not acc[0]:
+                return acc
         if not acc[1] and acc[0]:
             kept = self.rerun_select(acc[0])
             if kept is not None:
@@ -680,6 +692,8 @@ class Selector:
         for p in self.touched:
             if p.startswith("sqlglot/") and p.endswith(".py"):
                 continue
+            if p in EXECUTOR_FIXTURES and self.executor_fixture_same(p):
+                continue  # TestExecutor loads it, but nothing the per-query test uses changed
             # ... with the pinned fixtures and data too: not for a file the test reads
             sid = self.reads.get(p, NO_TESTS)
             if p.endswith(".py") or sid == GLOBAL or (sid >= 0 and self.sets[sid] & self.pq_bit):
@@ -870,7 +884,7 @@ class Selector:
             return None
         if TOTAL_CHILD_SECONDS - self.child_seconds < RERUN_SPARE:
             return None
-        red = self.reducible(bits)
+        red = self.reducible(bits) if RERUN_CASES else {}
         whole, cases, estimate, numbers = {}, {}, 0.0, {}
         dialect, dialect_ms = {}, 0
         pandas = False
@@ -1401,6 +1415,7 @@ class Selector:
         self.data_change(path, ch, acc)
 
     def data_change(self, path, ch, acc):
+        self.data_changes[path] = ch
         narrow = self.class_data_answer(path, ch)
         self.charge(acc, self.reads.get(path, NO_TESTS) if narrow is None else narrow)
         if ch.old_path and ch.old_path != path:
@@ -1409,6 +1424,106 @@ class Selector:
             parts = path.split("/")
             for i in range(1, len(parts)):
                 self.charge(acc, self.reads.get("/".join(parts[:i]) + "/", NO_TESTS))
+
+    def fresh_reachable(self):
+        """Whether a patch whose modules still import can change what a fresh interpreter sees
+        on ``import sqlglot`` (test_lazy_load: it imports, and only the base dialect is
+        registered): only by touching imports, the dialect registry, or module-level structure
+        nothing narrower modelled."""
+        if self.unmodeled or any(p in RERUN_REGISTRY for p in self.changed):
+            return True
+        for path, (_info, blocks) in self.changed.items():
+            for b in blocks:
+                if any(FRESH_SENSITIVE_RE.search(t) for t in b.old + b.new):
+                    return True
+        return False
+
+    def fresh_check_passes(self):
+        """Runs test_lazy_load's check (``import sqlglot`` in a new interpreter, the base dialect
+        alone registered) on a copy of the source tree with the patch applied."""
+        if not self.changed or any(not (p.startswith("sqlglot/") and p.endswith(".py")) for p in self.touched):
+            return False
+        import shutil
+        import subprocess
+        import tempfile
+
+        work = tempfile.mkdtemp(prefix="blast-fresh-")
+        try:
+            base = os.path.join(self.sources, "sqlglot")
+            for root, dirs, names in os.walk(base):
+                dirs[:] = [d for d in dirs if d != "__pycache__"]
+                rel = os.path.relpath(root, self.sources)
+                os.makedirs(os.path.join(work, rel), exist_ok=True)
+                for name in names:
+                    if name.endswith(".py"):
+                        os.symlink(os.path.join(root, name), os.path.join(work, rel, name))
+            for path, (info, blocks) in self.changed.items():
+                dest = os.path.join(work, path)
+                if os.path.lexists(dest):
+                    os.unlink(dest)
+                with open(dest, "w", encoding="utf-8") as f:
+                    f.write(self.patched_text(path, info, blocks))
+            code = "import sqlglot; assert len(sqlglot.Dialect._classes) == 1; print('Success')"
+            done = subprocess.run([sys.executable, "-S", "-B", "-c", code], cwd=work, capture_output=True,
+                                  text=True, timeout=20, env={"PATH": os.environ.get("PATH", ""), "PYTHONHASHSEED": "0"})
+            ok = "Success" in done.stdout
+        except Exception as error:  # noqa: BLE001
+            log("fresh interpreter check failed to run:", repr(error))
+            ok = False
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+        log("test_lazy_load checked in a fresh interpreter:", "passes - left out" if ok else "kept")
+        return ok
+
+    def executor_fixture_same(self, path):
+        """True if an edited fixture TestExecutor.setUpClass loads still loads, and (for the
+        TPC-DS one) every query keeps its SQL and meta, the only parts test_execute_tpcds uses
+        (``for args, sql, _ in sqls``): the per-query re-check against the pinned file holds."""
+        ch = self.data_changes.get(path)
+        if ch is None or ch.status != "modify" or not ch.hunked or not ch.blocks:
+            return False
+        try:
+            before, after = self.fixture_pairs(path, ch)
+        except Exception as error:  # noqa: BLE001
+            log(path, "could not be compared:", repr(error))
+            return False
+        if after is None:
+            return False  # no longer loads: setUpClass fails, and every test of the class
+        if path == EXECUTOR_FIXTURES[0]:
+            return len(before) == len(after) and all(a[:2] == b[:2] for a, b in zip(before, after))
+        return True  # the TPC-H file: test_execute_tpcds never uses its queries
+
+    def fixture_pairs(self, path, ch):
+        """(pairs of the pinned file, pairs of the patched one or None if it no longer loads),
+        read with the suite's own loader."""
+        import importlib.util
+        import shutil
+        import tempfile
+
+        with open(os.path.join(self.sources, path), "rb") as f:
+            raw = f.read()
+        old = raw.decode("utf-8").split("\n")
+        for b in ch.blocks:
+            if old[b.start - 1 : b.start - 1 + len(b.old)] != b.old:
+                raise ValueError("the patch does not apply")
+        new = _apply(old, ch.blocks, 1, len(old))
+        spec = importlib.util.spec_from_file_location("_fixture_helpers", os.path.join(self.sources, "tests", "helpers.py"))
+        helpers = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helpers)
+        work = tempfile.mkdtemp(prefix="blast-fixture-")
+        try:
+            for name, lines in (("old.sql", old), ("new.sql", new)):
+                with open(os.path.join(work, name), "w", encoding="utf-8") as f:
+                    f.write("\n".join(lines))
+            helpers.FIXTURES_DIR = work
+            before = list(helpers.load_sql_fixture_pairs("old.sql"))
+            try:
+                after = list(helpers.load_sql_fixture_pairs("new.sql"))
+            except Exception:  # noqa: BLE001
+                after = None
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+        return before, after
 
     def class_data_answer(self, path, ch):
         """For a SQL fixture a test class's setUpClass loads into a list: the tests that read it
