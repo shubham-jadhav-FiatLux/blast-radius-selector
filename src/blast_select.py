@@ -95,8 +95,8 @@ MAX_NODES_TEST = "tests/test_parser.py::TestParser::test_max_nodes"
 # A selection this small is cheaper to run here than to pay a worker for: dialect tests only
 # (they need nothing beyond sqlglot and the standard library), at most this many, recorded at
 # most this long together.
-RERUN_MAX_TESTS = 8
-RERUN_MAX_MS = 1000
+RERUN_MAX_TESTS = 40
+RERUN_MAX_MS = 1500
 RERUN_HEAVY_MS = 1500  # tests heavier than this stay scheduled (TPC-DS, max_nodes, ...)
 RERUN_SECONDS = 30.0
 RERUN_SPARE = 40.0  # child seconds kept for import checks
@@ -107,7 +107,8 @@ FRESH_CHECK_SAVING = 1.0  # verify test_lazy_load only when leaving it out saves
 FRESH_SENSITIVE_RE = re.compile(r"\bimport\b|importlib|__import__|_try_load|get_or_raise|_classes|__getattr__")
 EXECUTOR_FIXTURES = ("tests/fixtures/optimizer/tpc-ds/tpc-ds.sql", "tests/fixtures/optimizer/tpc-h/tpc-h.sql")
 RERUN_REGISTRY = ("sqlglot/dialects/dialect.py", "sqlglot/dialects/__init__.py")
-RERUN_DIRS = ("tests/dialects/",)
+RERUN_DIRS = ("tests/",)
+RERUN_SKIP = ("tests/test_sqlglotc.py",)  # builds the C extension: needs setuptools, absent here
 RERUN_UNAVAILABLE = ("tests/dialects/test_bigquery.py",)  # needs pytz
 
 # Imports the given sqlglot modules with some files replaced by patched copies, and prints the
@@ -1179,7 +1180,7 @@ class Selector:
         red = self.reducible(bits) if RERUN_CASES else {}
         whole, cases, estimate, numbers = {}, {}, 0.0, {}
         dialect, dialect_ms = {}, 0
-        pandas = False
+        pandas = executor = False
         rest = bits
         while rest:
             low = rest & -rest
@@ -1197,9 +1198,12 @@ class Selector:
                 cases[name] = (low, red[i])
                 estimate += ms / 1000 * len(red[i]) / max(rec["total"], 1) + 0.02
                 pandas = pandas or parts[0] in RERUN_PANDAS
-            elif ms <= RERUN_HEAVY_MS and self.test_ids[i].startswith(RERUN_DIRS):
+            elif ms <= RERUN_HEAVY_MS and self.test_ids[i].startswith(RERUN_DIRS) and not self.test_ids[i].startswith(RERUN_SKIP):
                 dialect[name] = low
-                dialect_ms += ms
+                # what a run costs here: optimizer tests about half again their recorded time
+                dialect_ms += int(ms * (1.5 if parts[0] == "tests/test_optimizer.py" else 1.0))
+                pandas = pandas or parts[0] in RERUN_PANDAS
+                executor = executor or parts[0] == "tests/test_executor.py"
         if dialect and len(dialect) <= RERUN_MAX_TESTS and dialect_ms <= RERUN_MAX_MS:
             whole = dialect
             estimate += dialect_ms / 1000
@@ -1208,7 +1212,7 @@ class Selector:
         drop = 0
         for low in list(whole.values()) + [c[0] for c in cases.values()]:
             drop |= low
-        estimate += 0.3 + (0.6 if pandas else 0.0)
+        estimate += 0.3 + (0.6 if pandas else 0.0) + (2.0 if executor else 0.0)  # (TestExecutor.setUpClass)
         saving = self.saving_without(bits, drop)
         if saving < RERUN_RETURN * estimate:
             return None
@@ -1274,9 +1278,14 @@ class Selector:
                 def addUnexpectedSuccess(self, test):
                     bad.add(test.id())
 
+            whole_names = [n for n in names if n not in allowed]
+            if whole_names:  # one suite, so that each class is set up once
+                current["allow"] = None
+                ut.TestSuite(ut.TestLoader().loadTestsFromNames(whole_names)).run(Result())
             for name in names:
-                current["allow"] = allowed.get(name)
-                ut.TestLoader().loadTestsFromName(name).run(Result())
+                if name in allowed:
+                    current["allow"] = allowed[name]
+                    ut.TestLoader().loadTestsFromName(name).run(Result())
             with open(out_path, "wb") as f:
                 pickle.dump((sorted(bad), sorted(ran)), f)
             return True
