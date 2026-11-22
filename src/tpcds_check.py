@@ -175,6 +175,10 @@ def value_digest(value, memo=None):
             out = "X:%s" % getattr(v, "__qualname__", repr(v))
         elif isinstance(v, _re.Pattern):
             out = node(["re", v.pattern, v.flags])
+        elif isinstance(v, (list, tuple)) and v and all(isinstance(x, type) for x in v):
+            # a sequence of classes is in practice a set turned into a tuple for isinstance()
+            # (_CANONICALIZE_TYPES): its order comes from set iteration, new on every import
+            out = node([type(v).__name__ + "-of-classes"] + sorted(fp(x) for x in v))
         elif isinstance(v, (list, tuple)):
             out = node([type(v).__name__] + [fp(x) for x in v])
         elif isinstance(v, dict):
