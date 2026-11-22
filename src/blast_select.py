@@ -586,8 +586,18 @@ class Selector:
             return False
         if any(path.startswith("tests/") for path in self.changed):
             return False  # the re-check replays the test as written at the pinned commit
-        if any(not (p.startswith("sqlglot/") and p.endswith(".py")) for p in self.touched):
-            return False  # ... with the pinned fixtures and data too
+        for p in self.touched:
+            if p.startswith("sqlglot/") and p.endswith(".py"):
+                continue
+            # ... with the pinned fixtures and data too: not for a file the test reads
+            sid = self.reads.get(p, NO_TESTS)
+            if p.endswith(".py") or sid == GLOBAL or (sid >= 0 and self.sets[sid] & self.pq_bit):
+                return False
+            parts = p.split("/")
+            for i in range(1, len(parts)):
+                d = self.reads.get("/".join(parts[:i]) + "/", NO_TESTS)
+                if d == GLOBAL or (d >= 0 and self.sets[d] & self.pq_bit):
+                    return False
         if self.plans is None or back is None:
             full = set(queries)
         else:
