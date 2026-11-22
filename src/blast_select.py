@@ -586,6 +586,7 @@ class Selector:
         #  those queries the edit reaches after their plan exists, steps it reaches before that]
         acc = [0, False, set(), False, set(), 0]
         self.last_acc = acc
+        self.pq_status = None
         self.why = None
         self.line_charges = []  # (path, line) charged line by line
         self.other_bits = 0  # tests charged any other way
@@ -674,6 +675,7 @@ class Selector:
         query, and any whose plan did change, passes if the patched sources give the same result
         table and the same duckdb SQL. Only tried when that is much cheaper than running the test."""
         ref = self.per_query
+        self.pq_status = "guard"
         queries = set(queries)
         if any(k >= len(ref["rows"]) for k in queries):
             return False
@@ -712,6 +714,7 @@ class Selector:
         estimate = run_cost(full) + sum(plans["seconds"][k] if replay[k] is None else replay[k] for k in cheap)
         limit = WHOLE_RECHECK_BUDGET if whole else min(PER_QUERY_BUDGET, 0.6 * saving)
         if estimate > limit:
+            self.pq_status = "estimate"
             log("per-query test: %d queries (%d before planning only), about %.1f s to re-check for %.1f s saved; "
                 "running it whole" % (len(queries), len(cheap), estimate, saving))
             return False
@@ -822,6 +825,7 @@ class Selector:
                     return False
             return True
 
+        self.pq_status = "tried"
         cap = WHOLE_RECHECK_SECONDS if whole else min(CHILD_SECONDS, 3 * limit + 3)
         ok = self.in_patched_child(same, timeout=cap, snapshot=snapshot if values else None)
         if ok:
@@ -2279,17 +2283,18 @@ def main():
                     bits ^= low
             workers = cache[key] = split(chosen, ms)
         # Measurement build: the TPC-DS test is left out of every plan; a commit that held it
-        # burns CPU by why the re-check kept it (base 3, 0.3 s units): 0.3 nothing tried,
-        # 0.9 charged whole and not tried, 2.7 estimate over the limit, 8.1 a query's result
-        # changed, 24.3 any other failure. The misses say on how many it really fails.
+        # burns CPU by why the re-check kept it (base 3, 0.3 s units): 0.3 never called,
+        # 0.9 charged whole and not tried, 2.7 estimate over the limit, 8.1 tried in a child
+        # and failed, 24.3 refused by a guard. The misses say on how many it really fails.
         held = {t for w in workers for t in w}
         if 1106 in held:
             text = " ".join(_CAPTURED)
-            if "changes with this patch" in text or "change with this patch" in text:
-                burn = 8.1
-            elif "running it whole" in text:
+            status = getattr(selector, "pq_status", None)
+            if status == "tried":
+                burn = 8.1  # re-checked in a child, and some query came out different there
+            elif status == "estimate":
                 burn = 2.7
-            elif "per-query test" in text:
+            elif status == "guard":
                 burn = 24.3
             elif getattr(selector, "last_acc", None) is not None and selector.last_acc[3]:
                 burn = 0.9  # charged as a whole, no full re-check tried
