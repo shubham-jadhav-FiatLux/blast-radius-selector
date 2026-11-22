@@ -33,6 +33,7 @@ import zlib
 
 import state_diff
 import tpcds_check
+import tpcds_memo
 
 DATA = os.environ.get("BLAST_DATA", "/data")
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -72,6 +73,7 @@ IMPORT_BASELINE = os.environ.get("BLAST_IMPORT_BASELINE", os.path.join(HERE, "im
 PLANS_PATH = os.environ.get("BLAST_TPCDS_PLANS", os.path.join(HERE, "tpcds_plans.json"))
 POINTS_PATH = os.path.splitext(PLANS_PATH)[0] + "_points.pickle"
 DUCK_PATH = os.path.splitext(PLANS_PATH)[0] + "_duck.json"
+MEMO_DIR = os.path.join(os.path.dirname(PLANS_PATH), "tpcds_memo")  # tpcds_memo.py, built in the image
 # What test_max_nodes sees on scaled copies of its input at the pinned commit (max_nodes_check.py).
 MAX_NODES_REF = os.environ.get("BLAST_MAX_NODES_REF", os.path.join(HERE, "max_nodes_ref.json"))
 MAX_NODES_TEST = "tests/test_parser.py::TestParser::test_max_nodes"
@@ -732,7 +734,17 @@ class Selector:
                 cost += ref["load"]
             return cost
 
-        estimate = run_cost(full) + sum(plans["seconds"][k] if replay[k] is None else replay[k] for k in cheap)
+        # a query run to its end replays the executor steps the edit cannot reach from records
+        ranges = self.memo_ranges() if full and not values else None
+        memo = self.memo_index() if ranges is not None else None
+        shares = {}
+        if memo is not None:
+            for k in full:
+                share = tpcds_memo.estimate(memo, ranges, k)
+                if share is not None:
+                    shares[k] = share
+        full_cost = run_cost(full) - sum(ref["seconds"][k] * (1.0 - share) for k, share in shares.items())
+        estimate = full_cost + sum(plans["seconds"][k] if replay[k] is None else replay[k] for k in cheap)
         text_run = [k for k, (meta, _sql) in textual.items() if meta.get("execute")]
         if text_run:
             # run by sqlglot's executor and by duckdb (views, pandas), on the pinned tables
@@ -855,8 +867,18 @@ class Selector:
                 if got != (plans["plans"][k], plans["duckdb"][k]) and not results_same(k):
                     return False
             if full:
+                steps_replay = None
+                if shares:
+                    try:
+                        import tpcds_memo as memo_module
+
+                        steps_replay = memo_module.Replay(MEMO_DIR, ranges, memo)
+                        steps_replay.install()
+                    except Exception as error:  # noqa: BLE001
+                        log("per-query test: no step replay:", repr(error)[:120])
+                        steps_replay = None
                 try:
-                    got = within(3 * run_cost(full) + 1.0, module.fingerprints, self.sources, sorted(full))
+                    got = within(3 * run_cost(full) + 1.0, module.fingerprints, self.sources, sorted(full), steps_replay)
                 except OverTime:
                     log("per-query test: queries", sorted(full), "run far longer with this patch")
                     return False
@@ -872,9 +894,58 @@ class Selector:
         ok = self.in_patched_child(same, timeout=cap, snapshot=snapshot if values else None)
         if ok:
             log("per-query test passes for queries", sorted(set(queries) | set(textual)),
-                "(%d by checkpoints, %d by plan, %d by new text) - left out"
-                % (len(by_points), len(cheap) - len(by_points), len(textual)))
+                "(%d by checkpoints, %d by plan, %d by new text, %d by step records) - left out"
+                % (len(by_points), len(cheap) - len(by_points), len(textual), len(shares)))
         return ok
+
+    def memo_ranges(self):
+        """The edited line ranges of sqlglot's Python files ({path: [(first, last)]}) for the
+        TPC-DS step replay, when every edited line sits in the body of a function, so it only runs
+        when called, never while a module is imported (a def line runs where the def stands);
+        None otherwise, and for an edit to anything but sqlglot's Python files."""
+        if not self.changed or any(not (p.startswith("sqlglot/") and p.endswith(".py")) for p in self.touched):
+            return None
+        out = {}
+        for path, (info, blocks) in self.changed.items():
+            lines = self.source_lines(path, info)
+            if lines is None:
+                return None
+            try:
+                tree = ast.parse("\n".join(lines))
+            except (SyntaxError, ValueError):
+                return None
+            defs = [(n.lineno, n.end_lineno, n.col_offset) for n in ast.walk(tree)
+                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.end_lineno]
+
+            def in_body(first, last, indent):
+                # lines first..last lie in a def's body, and added code is indented inside it
+                return any(lo < first and last <= hi and (indent is None or indent > col) for lo, hi, col in defs)
+
+            spans = []
+            for b in blocks:
+                code = [t for t in b.new if t.strip() and not t.lstrip().startswith("#")]
+                indent = min((len(t) - len(t.lstrip()) for t in code), default=None)
+                if b.old:
+                    first, last = b.start, b.start + len(b.old) - 1
+                else:
+                    first, last = b.start - 1, b.start  # added between these two lines
+                if not in_body(first, last, indent):
+                    return None
+                spans.append((first, last))
+            out[path] = spans
+        return out
+
+    def memo_index(self):
+        """The TPC-DS step records' index (tpcds_memo), loaded once; None when the image has none."""
+        if not hasattr(self, "_memo_index"):
+            import marshal
+
+            try:
+                with open(os.path.join(MEMO_DIR, tpcds_memo.INDEX), "rb") as f:
+                    self._memo_index = marshal.load(f)
+            except (OSError, ValueError, EOFError):
+                self._memo_index = None
+        return self._memo_index
 
     def reducible(self, bits):
         """{test index: {(file, case)}} for the selected fixture tests that only the charged

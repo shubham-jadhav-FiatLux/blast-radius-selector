@@ -15,13 +15,15 @@ COPY data/sqlglot-src.tar.xz /tmp/sqlglot-src.tar.xz
 # are committed in data/, so the build needs no network. The selector verifies every file against
 # the map's digests and uses them to check that a patched module still compiles and imports, and
 # to replay single TPC-DS queries. The digests of each TPC-DS query's plan are computed here, in
-# the image that will use them (a missing file only disables comparing plans).
+# the image that will use them (a missing file only disables comparing plans), and so are the
+# executor's step records that let a re-check run only the steps an edit reaches.
 RUN python -c "import tarfile; tarfile.open('/tmp/sqlglot-src.tar.xz').extractall('/app/sqlglot-src', filter='data')" \
     && rm /tmp/sqlglot-src.tar.xz \
     && python -m compileall -q /app/sqlglot-src/sqlglot \
     && python -S -B /app/import_baseline.py /app/sqlglot-src /app/import_baseline.txt \
     && python -S -B /app/tpcds_check.py --plans /app/sqlglot-src /app/tpcds_plans.json \
     && python -S -B /app/tpcds_check.py --duck /app/sqlglot-src /app/tpcds_plans_duck.json \
+    && python -S -B /app/tpcds_memo.py /app/sqlglot-src /app/tpcds_memo \
     && python -S -B /app/max_nodes_check.py --reference /app/sqlglot-src /app/max_nodes_ref.json \
     && python -m compileall -q /app/blast_select.py \
     && chmod -R a+rX /app

@@ -65,14 +65,15 @@ def _digest(value):
     return hashlib.sha1(repr(value).encode("utf-8")).hexdigest()
 
 
-def plan_digest(value):
+def plan_digest(value, memo=None):
     """A digest of everything the executor reads from a plan: its steps and how they depend on
     each other, and every expression in them with its arguments, type, comments and meta. Sets
-    are digested in sorted order, so object identities never matter. Works on any value."""
+    are digested in sorted order, so object identities never matter. Works on any value.
+    ``memo`` may be shared by calls on values that stay alive meanwhile (one plan's steps)."""
     from sqlglot.expressions.core import Expr
     from sqlglot.planner import Step
 
-    memo = {}
+    memo = {} if memo is None else memo
     atoms = (str, int, float, bool, bytes, type(None))
 
     def node(parts):
@@ -548,7 +549,9 @@ def checkpoint_check(root, point, steps):
     return True
 
 
-def fingerprints(root, queries):
+def fingerprints(root, queries, replay=None):
+    """``replay`` (tpcds_memo.Replay, installed): runs each query it can replay by its step
+    records, with only the steps the edit can reach run."""
     if root not in sys.path:
         sys.path.insert(0, root)
     from sqlglot import find_tables, parse_one, transpile
@@ -572,7 +575,13 @@ def fingerprints(root, queries):
             out[k] = (None, None)
             continue
         found = {t.name: tables[t.name] for t in find_tables(expression)}
-        table = pickle.loads(pickle.dumps(execute(expression, schema=schema, tables=found)))
+        if replay is not None:
+            replay.active = k if replay.usable(k) else None
+        try:
+            table = pickle.loads(pickle.dumps(execute(expression, schema=schema, tables=found)))
+        finally:
+            if replay is not None:
+                replay.active = None
         rows = _digest((list(table.columns), [tuple(row) for row in table.rows]))
         out[k] = (rows, _digest(transpile(sql, write="duckdb")[0]))
     return out
