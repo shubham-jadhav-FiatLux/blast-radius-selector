@@ -44,6 +44,9 @@ NONE, RUNTIME, IMPORT, MIXED, DOC = 0, 1, 2, 3, 4
 IN_STRING, STRING_AFTER, CONTINUED = 1, 2, 4
 WORKER_MS = 2000
 MAX_WORKERS = 8
+WHOLE_RECHECK_SAVING = 10.0  # a re-check of every query, only for at least this many seconds
+WHOLE_RECHECK_SECONDS = 30.0  # the child doing it
+WHOLE_RECHECK_BUDGET = 40.0  # its estimate (build-time seconds, about twice the actual cost)
 PER_QUERY_BUDGET = 16.0  # most seconds of re-checking ever worth trying instead of a 21 s test
 CHILD_SECONDS = 20.0  # longest any single patched child may run before it is killed
 IMPORT_SECONDS = 8.0  # an import check normally takes well under a second
@@ -455,6 +458,7 @@ class Selector:
         self.key_readers = blob.get("key_readers", {})
         self.global_readers = blob.get("global_readers")
         self.global_external = blob.get("global_external", {})
+        self.attr_queries = blob.get("attr_queries", {})
         self._pristine = {}
         self.source_readers = blob.get("source_readers", {})
         self.test_ids = list(blob.get("tests", ()))
@@ -535,6 +539,18 @@ class Selector:
             if self.recheck_queries(acc[2], self.saving_without(acc[0], self.pq_bit), acc[4], acc[5],
                                     sorted(self.import_values)):
                 acc[0] &= ~self.pq_bit
+        elif not acc[1] and acc[0] & self.pq_bit and acc[3] and self.per_query:
+            # reached as a whole: every query is re-checked, when leaving the test out saves
+            # enough (a full re-check costs well under the test's own 21 s)
+            saving = self.saving_without(acc[0], self.pq_bit)
+            # never at the expense of the import checks of the commits still to come
+            spare = TOTAL_CHILD_SECONDS - self.child_seconds
+            if saving >= WHOLE_RECHECK_SAVING and spare > 2 * WHOLE_RECHECK_SECONDS:
+                every = range(len(self.per_query["rows"]))
+                if self.recheck_queries(every, saving, None, 0, sorted(self.import_values), whole=True):
+                    acc[0] &= ~self.pq_bit
+                else:
+                    log("per-query test reached as a whole: kept")
         return acc
 
     def saving_without(self, bits, drop):
@@ -554,7 +570,7 @@ class Selector:
 
         return (_cost(split(numbers(bits), self.ms), self.ms) - _cost(split(numbers(bits & ~drop), self.ms), self.ms)) / 1000
 
-    def recheck_queries(self, queries, saving=float("inf"), back=None, steps=0, values=()):
+    def recheck_queries(self, queries, saving=float("inf"), back=None, steps=0, values=(), whole=False):
         """True if the per-query test still passes for every query the edit can reach.
 
         A query the edit only reaches before its plan exists (parsing, optimizing, planning)
@@ -570,6 +586,8 @@ class Selector:
             return False
         if any(path.startswith("tests/") for path in self.changed):
             return False  # the re-check replays the test as written at the pinned commit
+        if any(not (p.startswith("sqlglot/") and p.endswith(".py")) for p in self.touched):
+            return False  # ... with the pinned fixtures and data too
         if self.plans is None or back is None:
             full = set(queries)
         else:
@@ -589,7 +607,7 @@ class Selector:
             return cost
 
         estimate = run_cost(full) + sum(plans["seconds"][k] if replay[k] is None else replay[k] for k in cheap)
-        limit = min(PER_QUERY_BUDGET, 0.6 * saving)
+        limit = WHOLE_RECHECK_BUDGET if whole else min(PER_QUERY_BUDGET, 0.6 * saving)
         if estimate > limit:
             log("per-query test: %d queries (%d before planning only), about %.1f s to re-check for %.1f s saved; "
                 "running it whole" % (len(queries), len(cheap), estimate, saving))
@@ -681,7 +699,8 @@ class Selector:
                     return False
             return True
 
-        ok = self.in_patched_child(same, timeout=min(CHILD_SECONDS, 3 * limit + 3), snapshot=snapshot if values else None)
+        cap = WHOLE_RECHECK_SECONDS if whole else min(CHILD_SECONDS, 3 * limit + 3)
+        ok = self.in_patched_child(same, timeout=cap, snapshot=snapshot if values else None)
         if ok:
             log("per-query test passes for queries", sorted(queries),
                 "(%d by checkpoints, %d by plan) - left out" % (len(by_points), len(cheap) - len(by_points)))
@@ -1106,7 +1125,7 @@ class Selector:
             if head(old[0]) == head(new[0]):
                 log(path, "edit inside the body of %s; charging the tests that ran it" % old[0].name)
                 for l2 in range(u0, u1 + 1):
-                    self.charge(acc, info["sets"].get(l2, NO_TESTS))
+                    self.charge_line(acc, info, l2)  # with the queries of the per-query test
                     if l2 in info["checks"]:
                         self.import_check.add(path)
                 return True
@@ -1175,10 +1194,21 @@ class Selector:
             if key[0] == "k":
                 continue
             sid = self.state_charge(key, how, diff.get(("k",) + key))
+            if isinstance(sid, tuple):  # a changed function: the lines it ran, with their queries
+                path, a, z = sid
+                for ln in range(a, z + 1):
+                    self.charge_line(acc, self.files[path], ln)
+                charged += 1
+                continue
             if sid == GLOBAL:
                 log("state diff: %s %s reaches every test" % (how, key[1:]))
                 return False
-            self.charge(acc, sid)
+            qs = self.attr_queries.get("%s:%s" % key[1:]) if key[0] == "a" and how == "changed" else None
+            if qs is not None:
+                queries = tuple(qs[0])
+                self.charge(acc, sid, queries, self.back_of_known(queries, qs[1]), qs[2])
+            else:
+                self.charge(acc, sid)
             charged += 1
         log("state diff over %d modules: %d values changed" % (len(names), charged))
         return True
@@ -1215,14 +1245,9 @@ class Selector:
             lines = self.def_lines(func)
             if lines is not None:
                 path, a, z = lines
-                bits = 0
-                for ln in range(a, z + 1):
-                    sid = self.files[path]["sets"].get(ln, NO_TESTS)
-                    if sid == GLOBAL:
-                        return GLOBAL
-                    if sid >= 0:
-                        bits |= self.sets[sid]
-                return self.bits_sid(bits)
+                if any(self.files[path]["sets"].get(ln) == GLOBAL for ln in range(a, z + 1)):
+                    return GLOBAL
+                return lines
         if how == "added":
             if kind == "g":
                 return NO_TESTS  # a new module global: only new code can name it
@@ -1500,7 +1525,7 @@ class Selector:
                 continue
             log(path, "changes which names a function binds; charging the whole function")
             for ln in range(u0, u1 + 1):
-                self.charge(acc, info["sets"].get(ln, NO_TESTS))
+                self.charge_line(acc, info, ln)  # with the queries of the per-query test
                 if ln in info["checks"]:
                     self.import_check.add(path)
 
@@ -1696,8 +1721,9 @@ class Selector:
                         continue
                 if not pairs and k in (IMPORT, MIXED) and self.whole_entry_edit(info, b):
                     # whole lines added to or removed from the middle of a class-level table
-                    sid, _check, *_ = info["cattr"][ln]
-                    self.charge(acc, sid)
+                    sid, _check, *qs = info["cattr"][ln]
+                    queries = tuple(qs[0]) if qs else None
+                    self.charge(acc, sid, queries, self.back_of_known(queries, qs[1]) if qs else None, qs[2] if qs else 0)
                     self.import_check.add(path)
                     continue
                 if self.scoped_edit(path, info, b, i, ln, acc):

@@ -1435,8 +1435,14 @@ def main():
     # every class attribute the profile saw read ("owner:attr"), and per key for the dicts read
     # by key (with what reads the whole dict or was never keyed), and every module global.
     attr_out = {}
+    attr_q = {}  # tag -> (queries, back, steps) of the per-query test that read it, when known
     for tag in set(attr_reads) | attr_global:
         attr_out[tag] = GLOBAL if tag in attr_global else table.add(attr_reads[tag])
+        if tag not in attr_global and attr_reads[tag] & pq_bit:
+            owner, _, attr = tag.rpartition(":")
+            qs = attr_query_sets({(owner, attr)})
+            if qs is not None:
+                attr_q[tag] = qs
     key_out = {}
     by_tag = defaultdict(dict)
     for (tag, k), bits in key_bits.items():
@@ -1493,6 +1499,7 @@ def main():
         "key_readers": key_out,
         "global_readers": global_out,
         "global_external": external_out,
+        "attr_queries": attr_q,
         "commit": PINNED,
         "tests": tests.ids,
         "files": out_files,
