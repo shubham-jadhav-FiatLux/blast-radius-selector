@@ -2199,7 +2199,10 @@ class Selector:
                 if k in (RUNTIME, MIXED) and pairs and len(b.old) == 1 and ln in info["weak"]:
                     hit = self.weak_match(info["weak"][ln], b.old[0], b.new[0])
                     if hit is not None:
-                        self.charge(acc, hit[0], hit[1], self.back_of(info, ln, hit[1]), info.get("stg", {}).get(ln, 0))
+                        # a swapped operator or constant acts only where its line runs: without
+                        # queries of its own, the hit has those of the line
+                        hq = hit[1] if hit[1] is not None else info.get("qsets", {}).get(ln)
+                        self.charge(acc, hit[0], hq, self.back_of(info, ln, hq), info.get("stg", {}).get(ln, 0))
                         continue
                 qsets = info.get("qsets", {})
                 if k == RUNTIME:
