@@ -621,6 +621,59 @@ def write_plans(root, target):
         json.dump(out, f)
 
 
+_DUCK = {}
+
+
+def duck_digest(root, sql):
+    """A digest of what duckdb returns for ``transpile(sql, write="duckdb")`` on the TPC-DS views,
+    built as TestExecutor.setUpClass builds them. Equal for the patched and the pinned SQL means
+    the test's comparison of the two sides is what it was, the executor's side being unchanged."""
+    import site
+
+    site.main()  # the selector runs with -S
+    import duckdb
+
+    from sqlglot import transpile
+
+    conn = _DUCK.get("conn")
+    if conn is None:
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        from tests.helpers import TPCDS_SCHEMA
+
+        conn = duckdb.connect()
+        directory = os.path.join(root, "tests", "fixtures", "optimizer", "tpc-ds") + "/"
+        for table, columns in TPCDS_SCHEMA.items():
+            conn.execute(
+                f"""
+                CREATE VIEW {table} AS
+                SELECT *
+                FROM READ_CSV('{directory}{table}.csv.gz', delim='|', header=True, columns={columns})
+                """
+            )
+        _DUCK["conn"] = conn
+    frame = conn.execute(transpile(sql, write="duckdb")[0]).fetchdf()
+    return _digest((list(frame.columns), [tuple(repr(v) for v in row) for row in frame.itertuples(index=False)]))
+
+
+def write_duck(root, target):
+    """duckdb's answer digest for each executed query at the pinned commit (build time)."""
+    import json
+
+    sys.path.insert(0, root)
+    from tests.helpers import load_sql_fixture_pairs
+
+    out = {}
+    try:
+        for k, (meta, sql, _) in enumerate(load_sql_fixture_pairs(FIXTURE)):
+            if meta.get("execute"):
+                out[k] = duck_digest(root, sql)
+        with open(target, "w") as f:
+            json.dump(out, f)
+    except Exception as e:  # noqa: BLE001
+        print("tpcds_check: no duckdb answers:", repr(e), file=sys.stderr)
+
+
 def main():
     """Writes the reference fingerprints and timings: tpcds_check.py <sources> <out.json>"""
     import json
@@ -628,6 +681,9 @@ def main():
 
     if sys.argv[1] == "--plans":
         write_plans(sys.argv[2], sys.argv[3])
+        return
+    if sys.argv[1] == "--duck":
+        write_duck(sys.argv[2], sys.argv[3])
         return
     root, target = sys.argv[1], sys.argv[2]
     sys.path.insert(0, root)

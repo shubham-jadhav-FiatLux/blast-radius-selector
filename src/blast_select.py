@@ -65,6 +65,7 @@ IMPORT_BASELINE = os.environ.get("BLAST_IMPORT_BASELINE", os.path.join(HERE, "im
 # and the checkpoints of the steps that lead to it.
 PLANS_PATH = os.environ.get("BLAST_TPCDS_PLANS", os.path.join(HERE, "tpcds_plans.json"))
 POINTS_PATH = os.path.splitext(PLANS_PATH)[0] + "_points.pickle"
+DUCK_PATH = os.path.splitext(PLANS_PATH)[0] + "_duck.json"
 # What test_max_nodes sees on scaled copies of its input at the pinned commit (max_nodes_check.py).
 MAX_NODES_REF = os.environ.get("BLAST_MAX_NODES_REF", os.path.join(HERE, "max_nodes_ref.json"))
 MAX_NODES_TEST = "tests/test_parser.py::TestParser::test_max_nodes"
@@ -563,6 +564,12 @@ class Selector:
                     self.plans = plans
             except (OSError, ValueError, KeyError, TypeError):
                 pass
+        self.duck = {}
+        try:
+            with open(DUCK_PATH) as f:
+                self.duck = {int(k): v for k, v in json.load(f).items()}
+        except (OSError, ValueError):
+            pass
         self.core = set(blob.get("core", ())) or None
         self._warm = False
         self._baseline = None
@@ -715,10 +722,17 @@ class Selector:
             # in the child, before the patched modules replace the pinned ones
             return {v: tpcds_check.value_digest(tpcds_check.import_value(v)) for v in values}
 
+        duck = self.duck
+
         def same(before=None):
             import importlib.util
             import pickle
             import signal
+
+            sys.path.insert(0, self.sources)
+            from tests.helpers import load_sql_fixture_pairs as _pairs
+
+            sqls = [sql for _meta, sql, _ in _pairs(tpcds_check.FIXTURE)]
 
             spec = importlib.util.spec_from_file_location("tpcds_check", script)
             module = importlib.util.module_from_spec(spec)
@@ -762,10 +776,22 @@ class Selector:
                 except OverTime:
                     log("per-query test: query", k, "changes before planning and runs far longer")
                     return False
-                if got != (ref["rows"][k], ref["duckdb"][k]):
+                if got != (ref["rows"][k], ref["duckdb"][k]) and not duck_same(k, got):
                     log("per-query test: query", k, "changes with this patch")
                     return False
                 return True
+
+            def duck_same(k, got):
+                # the executor's answer is the pinned one; only the duckdb SQL differs: the test
+                # compares the two answers, so duckdb's must be the pinned one too
+                if got[0] != ref["rows"][k] or k not in duck or got[0] is None:
+                    return False
+                try:
+                    sql = sqls[k]
+                    return module.duck_digest(self.sources, sql) == duck[k]
+                except Exception as error:  # noqa: BLE001
+                    log("per-query test: duckdb check of query", k, "failed:", repr(error)[:120])
+                    return False
 
             fronts = set(cheap) - set(by_points)
             if by_points:
@@ -787,7 +813,8 @@ class Selector:
                 except OverTime:
                     log("per-query test: queries", sorted(full), "run far longer with this patch")
                     return False
-                differ = sorted(k for k in full if got.get(k) != (ref["rows"][k], ref["duckdb"][k]))
+                differ = sorted(k for k in full if got.get(k) != (ref["rows"][k], ref["duckdb"][k])
+                                and not duck_same(k, got.get(k, (None, None))))
                 if differ:
                     log("per-query test: queries", differ, "change with this patch")
                     return False
