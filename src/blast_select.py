@@ -777,7 +777,9 @@ class Selector:
                 return None
             ms = self.ms.get(self.index_to_number[i], 1 << 30)
             parts = self.test_ids[i].split("::")
-            if ms > RERUN_HEAVY_MS or len(parts) != 3 or not parts[0].endswith(".py"):
+            # a test that starts another interpreter would see the pinned sources there, so a
+            # pass here proves nothing: it stays
+            if ms > RERUN_HEAVY_MS or len(parts) != 3 or not parts[0].endswith(".py") or i in self.fresh:
                 heavy |= low
                 continue
             light["%s.%s.%s" % (parts[0][:-3].replace("/", "."), parts[1], parts[2])] = low
