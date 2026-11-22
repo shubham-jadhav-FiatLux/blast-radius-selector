@@ -95,14 +95,23 @@ MAX_NODES_TEST = "tests/test_parser.py::TestParser::test_max_nodes"
 # A selection this small is cheaper to run here than to pay a worker for: dialect tests only
 # (they need nothing beyond sqlglot and the standard library), at most this many, recorded at
 # most this long together.
-RERUN_MAX_TESTS = 40
-RERUN_MAX_MS = 1500
-RERUN_HEAVY_MS = 1500  # tests heavier than this stay scheduled (TPC-DS, max_nodes, ...)
+RERUN_MAX_TESTS = 150
+RERUN_MAX_MS = 6000  # estimated CPU (ms) of a commit's whole re-runs
+RERUN_HEAVY_MS = 7000  # tests heavier than this stay scheduled (TPC-DS, max_nodes): their own checks
+# CPU of a run here against the recorded time, measured for the heavier tests; by test file otherwise
+RERUN_FACTOR = {
+    "test_tpcds": 2.8, "test_scope": 1.2, "test_annotate_funcs": 0.9, "test_qualify_columns": 1.3,
+    "test_merge_subqueries": 1.2, "test_optimize_in_nulls": 1.2, "test_optimize_correlated_all": 1.4,
+    "test_simplify": 1.4, "test_canonicalize": 1.0, "test_execute_tpch": 0.4, "test_optimized_tpch": 1.5,
+    "test_agg_order": 1.1, "test_generator_memory": 0.55, "test_cache_does_not_retain_queries": 0.5,
+    "test_serde": 0.8, "test_recursion": 1.05,
+}
+RERUN_FILE_FACTOR = {"tests/test_optimizer.py": 1.3, "tests/test_executor.py": 1.0}
 RERUN_SECONDS = 30.0
 RERUN_SPARE = 40.0  # child seconds kept for import checks
 RERUN_RETURN = 1.5  # run only when the schedule gets this many times cheaper than the run costs
 RERUN_PANDAS = ("tests/test_optimizer.py", "tests/test_executor.py")
-RERUN_CASES = False  # fixture tests on their reached cases: no gain on practice for the CPU
+RERUN_CASES = True  # fixture tests on their reached cases
 FRESH_CHECK_SAVING = 1.0  # verify test_lazy_load only when leaving it out saves this much
 FRESH_SENSITIVE_RE = re.compile(r"\bimport\b|importlib|__import__|_try_load|get_or_raise|_classes|__getattr__")
 EXECUTOR_FIXTURES = ("tests/fixtures/optimizer/tpc-ds/tpc-ds.sql", "tests/fixtures/optimizer/tpc-h/tpc-h.sql")
@@ -1200,8 +1209,9 @@ class Selector:
                 pandas = pandas or parts[0] in RERUN_PANDAS
             elif ms <= RERUN_HEAVY_MS and self.test_ids[i].startswith(RERUN_DIRS) and not self.test_ids[i].startswith(RERUN_SKIP):
                 dialect[name] = low
-                # what a run costs here: optimizer tests about half again their recorded time
-                dialect_ms += int(ms * (1.5 if parts[0] == "tests/test_optimizer.py" else 1.0))
+                # what a run costs here (measured for the heavier tests)
+                factor = RERUN_FACTOR.get(parts[2], RERUN_FILE_FACTOR.get(parts[0], 0.9))
+                dialect_ms += int(ms * factor)
                 pandas = pandas or parts[0] in RERUN_PANDAS
                 executor = executor or parts[0] == "tests/test_executor.py"
         if dialect and len(dialect) <= RERUN_MAX_TESTS and dialect_ms <= RERUN_MAX_MS:
