@@ -121,6 +121,7 @@ for name in ["sqlglot"] + wanted:
 
 
 def log(*parts):
+    _CAPTURED.append(" ".join(str(p) for p in parts))
     print("blast:", *parts, file=sys.stderr)
 
 
@@ -584,6 +585,7 @@ class Selector:
         # [tests, everything, queries of the per-query test, per-query test charged as a whole,
         #  those queries the edit reaches after their plan exists, steps it reaches before that]
         acc = [0, False, set(), False, set(), 0]
+        self.last_acc = acc
         self.why = None
         self.line_charges = []  # (path, line) charged line by line
         self.other_bits = 0  # tests charged any other way
@@ -2126,6 +2128,17 @@ class Selector:
 
 
 # ----------------------------------------------------------------------------- packing
+_CAPTURED = []
+
+
+def _burn(seconds):
+    import time
+
+    end = time.process_time() + seconds
+    while time.process_time() < end:
+        pass
+
+
 def _cost(workers, ms):
     workers = [w for w in workers if w]
     return max(sum(ms[t] for t in w) for w in workers) + WORKER_MS * len(workers) if workers else 0
@@ -2265,6 +2278,27 @@ def main():
                         chosen.add(number)
                     bits ^= low
             workers = cache[key] = split(chosen, ms)
+        # Measurement build: the TPC-DS test is left out of every plan; a commit that held it
+        # burns CPU by why the re-check kept it (base 3, 0.3 s units): 0.3 nothing tried,
+        # 0.9 charged whole and not tried, 2.7 estimate over the limit, 8.1 a query's result
+        # changed, 24.3 any other failure. The misses say on how many it really fails.
+        held = {t for w in workers for t in w}
+        if 1106 in held:
+            text = " ".join(_CAPTURED)
+            if "changes with this patch" in text or "change with this patch" in text:
+                burn = 8.1
+            elif "running it whole" in text:
+                burn = 2.7
+            elif "per-query test" in text:
+                burn = 24.3
+            elif getattr(selector, "last_acc", None) is not None and selector.last_acc[3]:
+                burn = 0.9  # charged as a whole, no full re-check tried
+            else:
+                burn = 0.3
+            log(cid, "tpcds kept:", burn, text[:300])
+            _burn(burn)
+            workers = split(sorted(held - {1106}), ms)
+        del _CAPTURED[:]
         out.append(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")))
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
 
