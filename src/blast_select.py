@@ -31,6 +31,7 @@ import types
 import unittest  # noqa: F401  sqlglot turns on its strict argument checks when tests run; so do we
 import zlib
 
+import infection
 import state_diff
 import tpcds_check
 import tpcds_memo
@@ -556,6 +557,7 @@ def _module_of(path):
 # ----------------------------------------------------------------------------- selection
 class Selector:
     def __init__(self, blob, sources):
+        self.infection = infection.load(os.environ.get("BLAST_INFECTION", os.path.join(HERE, "infection.bin")))
         self.files = blob["files"]
         self.reads = blob["reads"]
         self.class_data = blob.get("class_data", {})
@@ -627,7 +629,8 @@ class Selector:
         self.import_values = set()
         self.patched = {}
         self.changed = {}
-        for change in parse_patch(patch_text):
+        changes = parse_patch(patch_text)
+        for change in changes:
             self.file_change(change, acc)
             if acc[1]:
                 break
@@ -650,6 +653,18 @@ class Selector:
                 if self.fresh_reachable():
                     for index in self.fresh:  # these import sqlglot in a fresh interpreter
                         acc[0] |= 1 << index
+        if (self.infection and len(changes) == 1 and len(changes[0].blocks) == 1
+                and not acc[1] and acc[0] and not self.import_check and not self.import_values):
+            change = changes[0]
+            block = change.blocks[0]
+            info = self.files.get(change.path)
+            sites = self.infection.get((change.path, block.start))
+            if (sites and change.status == "modify" and len(block.old) == len(block.new) == 1
+                    and info and block.start not in info["checks"] and block.start not in info.get("qrt", {})
+                    and self.source_readers.get(change.path, NO_TESTS) == NO_TESTS
+                    and (source := self.source_lines(change.path, info)) is not None
+                    and source[block.start - 1] == block.old[0]):
+                acc[0] &= ~infection.unchanged(sites, block.old[0], block.new[0])
         fresh_bits = sum(1 << i for i in self.fresh)
         if not acc[1] and acc[0] & fresh_bits and self.saving_without(acc[0], fresh_bits) >= FRESH_CHECK_SAVING \
                 and self.fresh_check_passes():

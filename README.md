@@ -11,6 +11,24 @@ assertion. Plain coverage stops at the first step. The selector answers each edi
 narrowest test set it can justify from the pinned commit, and falls back to something larger
 whenever it cannot justify less.
 
+## Build-time infection map
+
+The Docker build creates `/app/infection.bin` from the pinned sources. Four fork workers
+run the light tests of every test file, with a fresh process for
+each test. The profiler records operand observations only for passing tests. At a
+single-line comparison to an integer literal it records the distinct integer operands
+(up to 32 per site and test). At other simple comparisons it records which replacement
+operators would produce the same Boolean result for pairs of built-in primitives.
+Unsupported operand types, unobserved sites and ambiguous object identity retain the
+v31 selection. The existing weak-mutation map continues to handle Boolean short-circuit
+edits. Changes to arbitrary function arguments and statement insertions use v31's
+existing selection logic.
+
+The filter applies only to a single matching comparison edit in verified runtime source.
+Heavy tests are outside the profiling set and keep their existing checks. The scorer
+never supplies labels to the profiler. Set `BLAST_INFECTION` to a nonexistent file to
+run without the extra map.
+
 ## How it works
 
 Everything expensive happens offline, against the pinned commit, in the same image the track

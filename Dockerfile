@@ -33,4 +33,6 @@ RUN python -c "import tarfile; tarfile.open('/tmp/sqlglot-src.tar.xz').extractal
     && python -m compileall -q /app/blast_select.py \
     && chmod -R a+rX /app
 
+RUN python -B /app/build_infection.py /app/sqlglot-src /app/map.bin /app/infection.bin
+
 CMD ["python", "-S", "-B", "/app/run.py"]
